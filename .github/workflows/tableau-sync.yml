@@ -3,7 +3,7 @@ name: Tableau Sync
 on:
   schedule:
     # Runs every hour at minute 0 (adjust as needed)
-    - cron: '0 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:  # Allows manual trigger from GitHub UI
 
 jobs:
@@ -21,13 +21,3 @@ jobs:
             -H "Accept: application/x-ndjson" \
             --max-time 600 \
             "https://buyerlink-connect.floot.app/_api/tableau-raw-data/process"
-      
-      - name: Cleanup staging table (safety net)
-        if: always()  # Run even if the previous step fails/times out
-        run: |
-          echo "Running cleanup of staging table..."
-          curl -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-API-Key: ${{ secrets.TABLEAU_SYNC_API_KEY }}" \
-            --max-time 60 \
-            "https://buyerlink-connect.floot.app/_api/tableau-raw-data/cleanup"
