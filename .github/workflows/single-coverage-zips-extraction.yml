@@ -22,3 +22,4 @@ jobs:
             --max-time 540 \
             --no-buffer \
             "https://buyerlink-connect.floot.app/_api/single-coverage-zips/extract"
+# Re-register
