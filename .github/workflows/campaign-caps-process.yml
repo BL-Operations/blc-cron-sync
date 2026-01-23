@@ -3,7 +3,7 @@ name: Campaign Caps Processing
 on:
   schedule:
     # Adjust the frequency as needed - this example runs every 1 minute
-    - cron: '*/1 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:  # Allows manual triggering from GitHub UI
 
 jobs:
