@@ -14,7 +14,6 @@ jobs:
       - name: Extract Salesforce Accounts
         run: |
           curl -X POST \
-            -H "Content-Type: application/json" \
             -H "X-API-Key: ${{ secrets.EXTRACTION_API_KEY }}" \
             -H "Accept: application/x-ndjson" \
             --max-time 540 \
