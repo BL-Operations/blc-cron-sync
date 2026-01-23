@@ -1,0 +1,23 @@
+name: Campaign Caps Processing
+
+on:
+  schedule:
+    # Adjust the frequency as needed - this example runs every 15 minutes
+    - cron: '*/1 * * * *'
+  workflow_dispatch:  # Allows manual triggering from GitHub UI
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Process Campaign Caps Data
+        run: |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${{ secrets.EXTRACTION_API_KEY }}" \
+            -H "Accept: application/x-ndjson" \
+            --max-time 540 \
+            --no-buffer \
+            "https://buyerlink-connect.floot.app/_api/campaign-caps/process"
