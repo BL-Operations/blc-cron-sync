@@ -1,0 +1,24 @@
+name: Single Coverage Zips Extraction
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Trigger Single Coverage Zips Extraction
+        run: |
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${{ secrets.EXTRACTION_API_KEY }}" \
+            -H "X-Tableau-View-ID: ${{ secrets.TABLEAU_VIEW_ID }}" \
+            -H "Accept: application/x-ndjson" \
+            --max-time 540 \
+            --no-buffer \
+            "https://buyerlink-connect.floot.app/_api/single-coverage-zips/extract"
