@@ -3,7 +3,7 @@ name: Salesforce Account Extraction
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch:  # Allows manual triggering from GitHub UI
+  workflow_dispatch:
 
 jobs:
   extract:
@@ -20,4 +20,3 @@ jobs:
             --max-time 540 \
             --no-buffer \
             "https://buyerlink-connect.floot.app/_api/salesforce/accounts/extract"
-# Re-register
