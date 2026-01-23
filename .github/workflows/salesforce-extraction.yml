@@ -55,3 +55,4 @@ jobs:
           echo "### Extraction Job Completed" >> $GITHUB_STEP_SUMMARY
           echo "- **Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
           echo "- **Full Sync**: ${{ github.event.inputs.full_sync || 'false' }}" >> $GITHUB_STEP_SUMMARY
+# Re-register
