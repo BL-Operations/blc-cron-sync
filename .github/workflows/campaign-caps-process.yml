@@ -21,3 +21,4 @@ jobs:
             --max-time 540 \
             --no-buffer \
             "https://buyerlink-connect.floot.app/_api/campaign-caps/process"
+# Re-register
