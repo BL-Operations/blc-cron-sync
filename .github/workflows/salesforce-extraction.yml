@@ -1,58 +1,23 @@
 name: Salesforce Account Extraction
 
 on:
-  # Run every 10 minutes
   schedule:
-    - cron: '*/10 * * * *'
-
-  # Allow manual trigger
-  workflow_dispatch:
-    inputs:
-      full_sync:
-        description: 'Perform full sync (instead of delta)'
-        required: false
-        default: false
-        type: boolean
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # Allows manual triggering from GitHub UI
 
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 10
+    
     steps:
-      - name: Trigger Salesforce Extraction
+      - name: Extract Salesforce Accounts
         run: |
-          echo "Starting Salesforce account extraction..."
-
-          # Force a real boolean for the JSON payload:
-          FULL_SYNC=${{ fromJSON(github.event.inputs.full_sync || 'false') }}
-          echo "Full sync: $FULL_SYNC"
-
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "${{ secrets.API_BASE_URL }}/_api/salesforce/accounts/extract" \
+          curl -X POST \
             -H "Content-Type: application/json" \
             -H "X-API-Key: ${{ secrets.EXTRACTION_API_KEY }}" \
-            -d "{\"fullSync\": ${FULL_SYNC}}")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-
-          echo "Response code: $HTTP_CODE"
-          echo "Response body: $BODY"
-
-          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            echo "✅ Extraction completed successfully"
-          elif [ "$HTTP_CODE" -eq 409 ]; then
-            echo "⚠️ Extraction already in progress (409)"
-          else
-            echo "❌ Extraction failed with status $HTTP_CODE"
-            exit 1
-          fi
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "### Extraction Job Completed" >> $GITHUB_STEP_SUMMARY
-          echo "- **Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Full Sync**: ${{ github.event.inputs.full_sync || 'false' }}" >> $GITHUB_STEP_SUMMARY
+            -H "Accept: application/x-ndjson" \
+            --max-time 540 \
+            --no-buffer \
+            "https://buyerlink-connect.floot.app/_api/salesforce/accounts/extract"
 # Re-register
