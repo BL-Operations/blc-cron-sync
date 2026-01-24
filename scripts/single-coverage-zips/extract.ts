@@ -1,8 +1,10 @@
 import postgres from "postgres";
 
-// =============================================================================
+// =======================================================================
 // CONFIGURATION
-// =============================================================================
+// =======================================================================
+
+const BASE_URL = process.env.BASE_URL!;
 
 const config = {
   tableau: {
@@ -24,16 +26,16 @@ for (const [key, value] of Object.entries(config.tableau)) {
   if (!value) throw new Error(`Missing env var for tableau.${key}`);
 }
 if (!config.db.connectionString) throw new Error("Missing SUPABASE_DATABASE_URL");
+if (!BASE_URL) throw new Error("Missing BASE_URL");
 
-// =============================================================================
+// =======================================================================
 // TABLEAU API
-// =============================================================================
+// =======================================================================
 
 type TableauAuth = { token: string; siteId: string };
 
 async function authenticateTableau(): Promise<TableauAuth> {
   const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/auth/signin`;
-
   console.log("🔐 Authenticating to Tableau...");
 
   const response = await fetch(url, {
@@ -76,8 +78,7 @@ async function signOutTableau(token: string): Promise<void> {
 
 async function queryViewData(auth: TableauAuth, viewId: string): Promise<string> {
   const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/sites/${auth.siteId}/views/${viewId}/data`;
-
-  console.log("⬇️ Downloading all data from view...");
+  console.log("⬇ Downloading all data from view...");
 
   const response = await fetch(url, {
     method: "GET",
@@ -100,9 +101,9 @@ async function queryViewData(auth: TableauAuth, viewId: string): Promise<string>
   return lines.slice(firstNonEmpty).join("\n");
 }
 
-// =============================================================================
+// =======================================================================
 // CSV PARSING
-// =============================================================================
+// =======================================================================
 
 function parseCSVLine(text: string): string[] {
   const result: string[] = [];
@@ -147,9 +148,9 @@ function parseNumeric(value: string | undefined): number | null {
   return Number.isNaN(num) ? null : num;
 }
 
-// =============================================================================
+// =======================================================================
 // DATA TRANSFORMATION
-// =============================================================================
+// =======================================================================
 
 const MEASURE_MAP: Record<string, string> = {
   uec: "u_ec",
@@ -232,7 +233,7 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
     return [];
   }
   if (idx.category === -1) {
-    console.log("   ⚠️ Missing 'category' column - will use 'Unknown'");
+    console.log("   ⚠ Missing 'category' column - will use 'Unknown'");
   }
 
   // Group by composite key
@@ -307,9 +308,9 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
   }));
 }
 
-// =============================================================================
+// =======================================================================
 // DATABASE
-// =============================================================================
+// =======================================================================
 
 async function upsertRecords(sql: postgres.Sql, records: CoverageZipRecord[]): Promise<number> {
   if (records.length === 0) return 0;
@@ -371,9 +372,9 @@ async function upsertRecords(sql: postgres.Sql, records: CoverageZipRecord[]): P
   return upserted;
 }
 
-// =============================================================================
+// =======================================================================
 // MAIN
-// =============================================================================
+// =======================================================================
 
 async function main() {
   console.log("🚀 Starting Single Coverage Zips extraction");
@@ -390,7 +391,7 @@ async function main() {
     const csv = await queryViewData(auth, config.tableau.viewId);
 
     if (!csv || csv.length < 100) {
-      console.log("⚠️ Empty or minimal response from Tableau. Exiting.");
+      console.log("⚠ Empty or minimal response from Tableau. Exiting.");
       return;
     }
 
@@ -399,7 +400,7 @@ async function main() {
     const records = pivotCSVData(csv);
 
     if (records.length === 0) {
-      console.log("⚠️ No records after pivot. Exiting.");
+      console.log("⚠ No records after pivot. Exiting.");
       return;
     }
 
@@ -412,7 +413,7 @@ async function main() {
     console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
 
-    // After all CSV data is inserted into single_coverage_zips_raw
+    // 5. Trigger ZIP code enrichment
     console.log("Triggering ZIP code enrichment...");
 
     const enrichResponse = await fetch(`${BASE_URL}/_api/single-coverage-zips/enrich`, {
@@ -428,7 +429,7 @@ async function main() {
       console.error("ZIP enrichment failed:", errorText);
     } else {
       const enrichResult = await enrichResponse.json();
-      console.log("ZIP enrichment complete:", enrichResult);
+      console.log("✅ ZIP enrichment complete:", enrichResult);
     }
   } finally {
     // Cleanup
