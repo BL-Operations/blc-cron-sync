@@ -11,7 +11,6 @@ const config = {
     patName: process.env.TABLEAU_PAT_NAME!,
     patSecret: process.env.TABLEAU_PAT_SECRET!,
     viewId: process.env.TABLEAU_VIEW_SBC_ID!,
-    categoriesViewId: process.env.TABLEAU_CATEGORIES_VIEW_ID!,
     apiVersion: "3.20",
   },
   db: {
@@ -75,19 +74,11 @@ async function signOutTableau(token: string): Promise<void> {
   }
 }
 
-async function queryViewData(
-  auth: TableauAuth,
-  viewId: string,
-  categoryFilter?: string,
-  categoryFieldName?: string
-): Promise<string> {
-  let url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/sites/${auth.siteId}/views/${viewId}/data`;
-  
-  if (categoryFilter) {
-    const fieldName = categoryFieldName || "Category";
-    url += `?vf_${fieldName}=${encodeURIComponent(categoryFilter)}`;
-  }
+async function queryViewData(auth: TableauAuth, viewId: string): Promise<string> {
+  const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/sites/${auth.siteId}/views/${viewId}/data`;
 
+  console.log(`⬇️ Downloading all data from view...`);
+  
   const response = await fetch(url, {
     method: "GET",
     headers: { "X-Tableau-Auth": auth.token },
@@ -99,67 +90,15 @@ async function queryViewData(
   }
 
   const csv = await response.text();
+  console.log(`✅ Downloaded ${csv.length.toLocaleString()} characters`);
   
   // Strip leading blank lines
   const lines = csv.split(/\r?\n/);
   const firstNonEmpty = lines.findIndex(line => line.trim() !== "");
   
-  if (firstNonEmpty === -1) {
-    return "";
-  }
+  if (firstNonEmpty === -1) return "";
   
   return lines.slice(firstNonEmpty).join("\n");
-}
-
-async function getCategories(auth: TableauAuth): Promise<{ categories: string[], fieldName: string }> {
-  console.log(`📋 Fetching category list...`);
-  
-  const csv = await queryViewData(auth, config.tableau.categoriesViewId);
-  const lines = csv.split(/\r?\n/);
-  
-  if (lines.length < 2) {
-    console.log(`   ⚠️ Categories view returned no data`);
-    return { categories: [], fieldName: "Category" };
-  }
-  
-  const headers = parseCSVLine(lines[0]);
-  const lowerHeaders = headers.map(h => h.toLowerCase());
-  const categoryIdx = lowerHeaders.findIndex(h => h.includes("category"));
-  
-  if (categoryIdx === -1) {
-    console.log(`   Available headers: ${headers.join(", ")}`);
-    throw new Error("Category column not found in categories view");
-  }
-  
-  // Get the ACTUAL field name from the header (may have special chars)
-  const rawFieldName = headers[categoryIdx].trim();
-  
-  // Clean it - if it contains "category", just use "Category"
-  // Otherwise strip special characters
-  const fieldName = rawFieldName.toLowerCase().includes("category") 
-    ? "Category" 
-    : rawFieldName.replace(/[^a-zA-Z0-9\s]/g, "");
-  
-  console.log(`   Raw field name: "${rawFieldName}" → Using filter: "vf_${fieldName}"`);
-  
-  const categories = new Set<string>();
-  for (let i = 1; i < lines.length; i++) {
-    const row = parseCSVLine(lines[i]);
-    const cat = row[categoryIdx]?.trim();
-    if (cat && cat !== "" && cat.toLowerCase() !== "null") {
-      categories.add(cat);
-    }
-  }
-  
-  const result = Array.from(categories).sort();
-  console.log(`✅ Found ${result.length} categories`);
-  
-  // Log first few categories for debugging
-  if (result.length > 0) {
-    console.log(`   First 5: ${result.slice(0, 5).join(", ")}`);
-  }
-  
-  return { categories: result, fieldName };
 }
 
 // =============================================================================
@@ -256,41 +195,48 @@ type Record = {
   clicks_lmp: number | null;
 };
 
-function pivotCSVData(csv: string, categoryName: string): Record[] {
+function pivotCSVData(csv: string): Record[] {
   const lines = csv.split(/\r?\n/);
   if (lines.length < 2) return [];
   
   const headers = parseCSVLine(lines[0]).map(h => h.trim());
   const lowerHeaders = headers.map(h => h.toLowerCase());
   
-  // Log headers on first successful parse
-  console.log(`   📊 CSV has ${lines.length - 1} rows, ${headers.length} columns`);
+  console.log(`📊 CSV has ${(lines.length - 1).toLocaleString()} rows, ${headers.length} columns`);
+  console.log(`   Headers: ${headers.slice(0, 8).join(", ")}${headers.length > 8 ? "..." : ""}`);
   
   // Find column indices
   const idx = {
     buyerType: lowerHeaders.findIndex(h => h.includes("buyer") && h.includes("type")),
-    category: lowerHeaders.findIndex(h => h === "category" || h.includes("category")),
-    subcategory: lowerHeaders.findIndex(h => h === "subcategory" || h.includes("subcategory")),
+    category: lowerHeaders.findIndex(h => h.includes("category") && !h.includes("sub")),
+    subcategory: lowerHeaders.findIndex(h => h.includes("subcategory")),
     channel: lowerHeaders.findIndex(h => h === "channel"),
     zip: lowerHeaders.findIndex(h => h === "zip"),
     measureNames: lowerHeaders.findIndex(h => h.includes("measure") && h.includes("name")),
     measureValues: lowerHeaders.findIndex(h => h.includes("measure") && h.includes("value")),
   };
   
+  console.log(`   Column indices: zip=${idx.zip}, category=${idx.category}, measureNames=${idx.measureNames}, measureValues=${idx.measureValues}`);
+  
   // Check for required columns
   if (idx.zip === -1) {
-    console.log(`   ⚠️ Missing 'zip' column. Available: ${headers.join(", ")}`);
+    console.log(`   ❌ Missing 'zip' column. Available: ${headers.join(", ")}`);
     return [];
   }
   
   if (idx.measureNames === -1 || idx.measureValues === -1) {
-    console.log(`   ⚠️ Missing Measure Names/Values columns. Available: ${headers.join(", ")}`);
+    console.log(`   ❌ Missing Measure Names/Values columns`);
     return [];
+  }
+  
+  if (idx.category === -1) {
+    console.log(`   ⚠️ Missing 'category' column - will use 'Unknown'`);
   }
   
   // Group by composite key
   const grouped = new Map<string, { base: Partial<Record>; measures: Map<string, number> }>();
   
+  let processedRows = 0;
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
@@ -300,8 +246,7 @@ function pivotCSVData(csv: string, categoryName: string): Record[] {
     
     if (!zip) continue;
     
-    // Use the category from the filter, or from the row if available
-    const category = idx.category !== -1 ? row[idx.category]?.trim() || categoryName : categoryName;
+    const category = idx.category !== -1 ? row[idx.category]?.trim() || "Unknown" : "Unknown";
     const buyerType = idx.buyerType !== -1 ? row[idx.buyerType]?.trim() || null : null;
     const subcategory = idx.subcategory !== -1 ? row[idx.subcategory]?.trim() || null : null;
     const channel = idx.channel !== -1 ? row[idx.channel]?.trim() || null : null;
@@ -327,7 +272,15 @@ function pivotCSVData(csv: string, categoryName: string): Record[] {
         }
       }
     }
+    
+    processedRows++;
+    if (processedRows % 100000 === 0) {
+      console.log(`   Processed ${processedRows.toLocaleString()} rows...`);
+    }
   }
+  
+  console.log(`   Processed ${processedRows.toLocaleString()} total rows`);
+  console.log(`   Grouped into ${grouped.size.toLocaleString()} unique records`);
   
   // Convert to flat records
   return Array.from(grouped.values()).map(({ base, measures }) => ({
@@ -358,6 +311,8 @@ function pivotCSVData(csv: string, categoryName: string): Record[] {
 
 async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<number> {
   if (records.length === 0) return 0;
+  
+  console.log(`💾 Upserting ${records.length.toLocaleString()} records in batches of ${config.batchSize}...`);
   
   let upserted = 0;
   
@@ -390,6 +345,10 @@ async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<numb
     `;
     
     upserted += batch.length;
+    
+    if (upserted % 10000 === 0) {
+      console.log(`   Upserted ${upserted.toLocaleString()} records...`);
+    }
   }
   
   return upserted;
@@ -402,7 +361,6 @@ async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<numb
 async function main() {
   console.log("🚀 Starting Single Coverage Zips extraction");
   console.log(`   View ID: ${config.tableau.viewId}`);
-  console.log(`   Categories View ID: ${config.tableau.categoriesViewId}`);
   
   const sql = postgres(config.db.connectionString);
   let auth: TableauAuth | null = null;
@@ -411,70 +369,30 @@ async function main() {
     // 1. Authenticate
     auth = await authenticateTableau();
     
-    // 2. Get categories and field name
-    const { categories, fieldName } = await getCategories(auth);
+    // 2. Download ALL data (no category filter)
+    const csv = await queryViewData(auth, config.tableau.viewId);
     
-    if (categories.length === 0) {
-      console.log("⚠️ No categories found. Exiting.");
+    if (!csv || csv.length < 100) {
+      console.log("⚠️ Empty or minimal response from Tableau. Exiting.");
       return;
     }
     
-    console.log(`\n📌 Using filter field: vf_${fieldName}\n`);
+    // 3. Pivot the data
+    console.log(`\n🔄 Pivoting data...`);
+    const records = pivotCSVData(csv);
     
-    // 3. Process each category
-    let totalRecords = 0;
-    let successCount = 0;
-    let emptyCount = 0;
-    let errorCount = 0;
-    
-    for (let i = 0; i < categories.length; i++) {
-      const category = categories[i];
-      const progress = `[${i + 1}/${categories.length}]`;
-      
-      console.log(`📂 ${progress} Processing category: ${category}`);
-      
-      try {
-        // Download CSV with the discovered field name
-        console.log(`   ⬇️ Downloading data...`);
-        const csv = await queryViewData(auth, config.tableau.viewId, category, fieldName);
-        
-        // Check for empty response
-        if (!csv || csv.length < 10) {
-          console.log(`   ⏭️ Empty response (${csv?.length || 0} chars), skipping`);
-          emptyCount++;
-          continue;
-        }
-        
-        // Pivot data
-        console.log(`   🔄 Pivoting data...`);
-        const records = pivotCSVData(csv, category);
-        
-        if (records.length === 0) {
-          console.log(`   ⏭️ No records after pivot, skipping`);
-          emptyCount++;
-          continue;
-        }
-        
-        // Upsert
-        console.log(`   💾 Upserting ${records.length} records...`);
-        const count = await upsertRecords(sql, records);
-        totalRecords += count;
-        successCount++;
-        console.log(`   ✅ Done`);
-        
-      } catch (err) {
-        console.error(`   ❌ Error:`, err instanceof Error ? err.message : err);
-        errorCount++;
-        // Continue to next category instead of failing entirely
-      }
+    if (records.length === 0) {
+      console.log("⚠️ No records after pivot. Exiting.");
+      return;
     }
+    
+    // 4. Upsert to database
+    console.log(`\n💾 Writing to database...`);
+    const count = await upsertRecords(sql, records);
     
     console.log(`\n${"=".repeat(50)}`);
     console.log(`🎉 Extraction complete!`);
-    console.log(`   Total records upserted: ${totalRecords}`);
-    console.log(`   Categories processed: ${successCount}`);
-    console.log(`   Categories empty: ${emptyCount}`);
-    console.log(`   Categories with errors: ${errorCount}`);
+    console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
     
   } finally {
