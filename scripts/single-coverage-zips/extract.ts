@@ -392,6 +392,23 @@ async function main() {
     console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
 
+    // 5. Trigger ZIP enrichment via API
+    console.log(`\n🔍 Triggering ZIP code enrichment...`);
+    const enrichResponse = await fetch(`${process.env.APP_BASE_URL}/_api/single-coverage-zips/enrich`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.EXTRACTION_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+if (enrichResponse.ok) {
+  const enrichResult = await enrichResponse.json();
+  console.log(`✅ Enrichment complete: ${enrichResult.zipsLookedUp} ZIPs looked up, ${enrichResult.recordsEnriched} records updated`);
+} else {
+  console.warn(`⚠️ Enrichment call failed: ${enrichResponse.status}`);
+}
+
   } finally {
     // Cleanup
     if (auth) await signOutTableau(auth.token);
