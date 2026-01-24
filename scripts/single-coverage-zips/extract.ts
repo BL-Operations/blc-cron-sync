@@ -33,9 +33,9 @@ type TableauAuth = { token: string; siteId: string };
 
 async function authenticateTableau(): Promise<TableauAuth> {
   const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/auth/signin`;
-  
+
   console.log(`🔐 Authenticating to Tableau...`);
-  
+
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
@@ -55,7 +55,7 @@ async function authenticateTableau(): Promise<TableauAuth> {
 
   const data = await response.json();
   console.log(`✅ Authenticated successfully`);
-  
+
   return {
     token: data.credentials.token,
     siteId: data.credentials.site.id,
@@ -78,7 +78,7 @@ async function queryViewData(auth: TableauAuth, viewId: string): Promise<string>
   const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/sites/${auth.siteId}/views/${viewId}/data`;
 
   console.log(`⬇️ Downloading all data from view...`);
-  
+
   const response = await fetch(url, {
     method: "GET",
     headers: { "X-Tableau-Auth": auth.token },
@@ -91,13 +91,12 @@ async function queryViewData(auth: TableauAuth, viewId: string): Promise<string>
 
   const csv = await response.text();
   console.log(`✅ Downloaded ${csv.length.toLocaleString()} characters`);
-  
+
   // Strip leading blank lines
   const lines = csv.split(/\r?\n/);
   const firstNonEmpty = lines.findIndex(line => line.trim() !== "");
-  
   if (firstNonEmpty === -1) return "";
-  
+
   return lines.slice(firstNonEmpty).join("\n");
 }
 
@@ -109,7 +108,7 @@ function parseCSVLine(text: string): string[] {
   const result: string[] = [];
   let cur = "";
   let inQuote = false;
-  
+
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     if (inQuote) {
@@ -163,14 +162,14 @@ const MEASURE_MAP: Record<string, string> = {
 
 function mapMeasureName(name: string): string | null {
   const normalized = name.trim().toLowerCase();
-  
+
   if (MEASURE_MAP[normalized]) return MEASURE_MAP[normalized];
   if (normalized.includes("lead") && normalized.includes("rev")) return "lead_rev_scrubbed";
   if (normalized.includes("click") && normalized.includes("rev")) return "click_rev";
   if (normalized.includes("cmp") && normalized.includes("bid") && normalized.includes("mec")) return "cmp_bid_per_mec";
   if (normalized.includes("conv") && normalized.includes("%")) return "conv_percent";
   if (normalized.includes("price")) return "price";
-  
+
   return null;
 }
 
@@ -198,71 +197,69 @@ type Record = {
 function pivotCSVData(csv: string): Record[] {
   const lines = csv.split(/\r?\n/);
   if (lines.length < 2) return [];
-  
+
   const headers = parseCSVLine(lines[0]).map(h => h.trim());
   const lowerHeaders = headers.map(h => h.toLowerCase());
-  
+
   console.log(`📊 CSV has ${(lines.length - 1).toLocaleString()} rows, ${headers.length} columns`);
   console.log(`   Headers: ${headers.slice(0, 8).join(", ")}${headers.length > 8 ? "..." : ""}`);
-  
+
   // Find column indices
   const idx = {
     buyerType: lowerHeaders.findIndex(h => h.includes("buyer") && h.includes("type")),
     category: lowerHeaders.findIndex(h => h.includes("category") && !h.includes("sub")),
     subcategory: lowerHeaders.findIndex(h => h.includes("subcategory")),
     channel: lowerHeaders.findIndex(h => h === "channel"),
-    zip: lowerHeaders.findIndex(h => h === "zip"),
+    // FIX: Use flexible matching for zip column (handles "Zip Code", "zip", etc.)
+    zip: lowerHeaders.findIndex(h => h === "zip" || h === "zip code" || h.includes("zip")),
     measureNames: lowerHeaders.findIndex(h => h.includes("measure") && h.includes("name")),
     measureValues: lowerHeaders.findIndex(h => h.includes("measure") && h.includes("value")),
   };
-  
+
   console.log(`   Column indices: zip=${idx.zip}, category=${idx.category}, measureNames=${idx.measureNames}, measureValues=${idx.measureValues}`);
-  
+
   // Check for required columns
   if (idx.zip === -1) {
     console.log(`   ❌ Missing 'zip' column. Available: ${headers.join(", ")}`);
     return [];
   }
-  
   if (idx.measureNames === -1 || idx.measureValues === -1) {
     console.log(`   ❌ Missing Measure Names/Values columns`);
     return [];
   }
-  
   if (idx.category === -1) {
     console.log(`   ⚠️ Missing 'category' column - will use 'Unknown'`);
   }
-  
+
   // Group by composite key
   const grouped = new Map<string, { base: Partial<Record>; measures: Map<string, number> }>();
-  
+
   let processedRows = 0;
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    
+
     const row = parseCSVLine(line);
     const zip = row[idx.zip]?.trim();
-    
     if (!zip) continue;
-    
+
     const category = idx.category !== -1 ? row[idx.category]?.trim() || "Unknown" : "Unknown";
     const buyerType = idx.buyerType !== -1 ? row[idx.buyerType]?.trim() || null : null;
     const subcategory = idx.subcategory !== -1 ? row[idx.subcategory]?.trim() || null : null;
     const channel = idx.channel !== -1 ? row[idx.channel]?.trim() || null : null;
-    
+
     const key = `${buyerType}|${category}|${subcategory}|${channel}|${zip}`;
-    
+
     if (!grouped.has(key)) {
       grouped.set(key, {
         base: { buyer_type: buyerType, category, subcategory, channel, zip },
         measures: new Map(),
       });
     }
-    
+
     const measureName = row[idx.measureNames]?.trim();
     const measureValue = row[idx.measureValues]?.trim();
-    
+
     if (measureName && measureValue) {
       const col = mapMeasureName(measureName);
       if (col) {
@@ -272,16 +269,16 @@ function pivotCSVData(csv: string): Record[] {
         }
       }
     }
-    
+
     processedRows++;
     if (processedRows % 100000 === 0) {
       console.log(`   Processed ${processedRows.toLocaleString()} rows...`);
     }
   }
-  
+
   console.log(`   Processed ${processedRows.toLocaleString()} total rows`);
   console.log(`   Grouped into ${grouped.size.toLocaleString()} unique records`);
-  
+
   // Convert to flat records
   return Array.from(grouped.values()).map(({ base, measures }) => ({
     buyer_type: base.buyer_type ?? null,
@@ -311,16 +308,16 @@ function pivotCSVData(csv: string): Record[] {
 
 async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<number> {
   if (records.length === 0) return 0;
-  
+
   console.log(`💾 Upserting ${records.length.toLocaleString()} records in batches of ${config.batchSize}...`);
-  
+
   let upserted = 0;
-  
+
   for (let i = 0; i < records.length; i += config.batchSize) {
     const batch = records.slice(i, i + config.batchSize);
-    
+
     await sql`
-      INSERT INTO single_coverage_zips_raw ${sql(batch, 
+      INSERT INTO single_coverage_zips_raw ${sql(batch,
         'buyer_type', 'category', 'subcategory', 'channel', 'zip',
         'u_ec', 'r_ec', 'm_ec', 'r_leads', 'u_leads', 'legs',
         'lead_rev_scrubbed', 'click_rev', 'cmp_bid', 'cmp_bid_per_mec',
@@ -343,14 +340,14 @@ async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<numb
         clicks_lmp = EXCLUDED.clicks_lmp,
         updated_at = NOW()
     `;
-    
+
     upserted += batch.length;
-    
+
     if (upserted % 10000 === 0) {
       console.log(`   Upserted ${upserted.toLocaleString()} records...`);
     }
   }
-  
+
   return upserted;
 }
 
@@ -361,40 +358,40 @@ async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<numb
 async function main() {
   console.log("🚀 Starting Single Coverage Zips extraction");
   console.log(`   View ID: ${config.tableau.viewId}`);
-  
+
   const sql = postgres(config.db.connectionString);
   let auth: TableauAuth | null = null;
-  
+
   try {
     // 1. Authenticate
     auth = await authenticateTableau();
-    
+
     // 2. Download ALL data (no category filter)
     const csv = await queryViewData(auth, config.tableau.viewId);
-    
+
     if (!csv || csv.length < 100) {
       console.log("⚠️ Empty or minimal response from Tableau. Exiting.");
       return;
     }
-    
+
     // 3. Pivot the data
     console.log(`\n🔄 Pivoting data...`);
     const records = pivotCSVData(csv);
-    
+
     if (records.length === 0) {
       console.log("⚠️ No records after pivot. Exiting.");
       return;
     }
-    
+
     // 4. Upsert to database
     console.log(`\n💾 Writing to database...`);
     const count = await upsertRecords(sql, records);
-    
+
     console.log(`\n${"=".repeat(50)}`);
     console.log(`🎉 Extraction complete!`);
     console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
-    
+
   } finally {
     // Cleanup
     if (auth) await signOutTableau(auth.token);
