@@ -34,11 +34,11 @@ type TableauAuth = { token: string; siteId: string };
 async function authenticateTableau(): Promise<TableauAuth> {
   const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/auth/signin`;
 
-  console.log(`🔐 Authenticating to Tableau...`);
+  console.log("🔐 Authenticating to Tableau...");
 
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({
       credentials: {
         personalAccessTokenName: config.tableau.patName,
@@ -54,7 +54,7 @@ async function authenticateTableau(): Promise<TableauAuth> {
   }
 
   const data = await response.json();
-  console.log(`✅ Authenticated successfully`);
+  console.log("✅ Authenticated successfully");
 
   return {
     token: data.credentials.token,
@@ -68,7 +68,7 @@ async function signOutTableau(token: string): Promise<void> {
       method: "POST",
       headers: { "X-Tableau-Auth": token },
     });
-    console.log(`🚪 Signed out from Tableau`);
+    console.log("🚪 Signed out from Tableau");
   } catch (e) {
     console.warn("Sign out warning:", e);
   }
@@ -77,7 +77,7 @@ async function signOutTableau(token: string): Promise<void> {
 async function queryViewData(auth: TableauAuth, viewId: string): Promise<string> {
   const url = `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/sites/${auth.siteId}/views/${viewId}/data`;
 
-  console.log(`⬇️ Downloading all data from view...`);
+  console.log("⬇️ Downloading all data from view...");
 
   const response = await fetch(url, {
     method: "GET",
@@ -94,7 +94,7 @@ async function queryViewData(auth: TableauAuth, viewId: string): Promise<string>
 
   // Strip leading blank lines
   const lines = csv.split(/\r?\n/);
-  const firstNonEmpty = lines.findIndex(line => line.trim() !== "");
+  const firstNonEmpty = lines.findIndex((line) => line.trim() !== "");
   if (firstNonEmpty === -1) return "";
 
   return lines.slice(firstNonEmpty).join("\n");
@@ -111,6 +111,7 @@ function parseCSVLine(text: string): string[] {
 
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
+
     if (inQuote) {
       if (char === '"') {
         if (i + 1 < text.length && text[i + 1] === '"') {
@@ -125,7 +126,7 @@ function parseCSVLine(text: string): string[] {
     } else {
       if (char === '"') {
         inQuote = true;
-      } else if (char === ',') {
+      } else if (char === ",") {
         result.push(cur);
         cur = "";
       } else {
@@ -133,6 +134,7 @@ function parseCSVLine(text: string): string[] {
       }
     }
   }
+
   result.push(cur);
   return result;
 }
@@ -142,7 +144,7 @@ function parseNumeric(value: string | undefined): number | null {
   const cleaned = value.replace(/[,$%]/g, "").trim();
   if (cleaned === "" || cleaned.toLowerCase() === "null") return null;
   const num = parseFloat(cleaned);
-  return isNaN(num) ? null : num;
+  return Number.isNaN(num) ? null : num;
 }
 
 // =============================================================================
@@ -150,12 +152,12 @@ function parseNumeric(value: string | undefined): number | null {
 // =============================================================================
 
 const MEASURE_MAP: Record<string, string> = {
-  "uec": "u_ec",
-  "rec": "r_ec",
-  "mec": "m_ec",
-  "rleads": "r_leads",
-  "uleads": "u_leads",
-  "legs": "legs",
+  uec: "u_ec",
+  rec: "r_ec",
+  mec: "m_ec",
+  rleads: "r_leads",
+  uleads: "u_leads",
+  legs: "legs",
   "clicks lmp": "clicks_lmp",
   "cmp bid": "cmp_bid",
 };
@@ -173,7 +175,7 @@ function mapMeasureName(name: string): string | null {
   return null;
 }
 
-type Record = {
+type CoverageZipRecord = {
   buyer_type: string | null;
   category: string;
   subcategory: string | null;
@@ -194,29 +196,31 @@ type Record = {
   clicks_lmp: number | null;
 };
 
-function pivotCSVData(csv: string): Record[] {
+function pivotCSVData(csv: string): CoverageZipRecord[] {
   const lines = csv.split(/\r?\n/);
   if (lines.length < 2) return [];
 
-  const headers = parseCSVLine(lines[0]).map(h => h.trim());
-  const lowerHeaders = headers.map(h => h.toLowerCase());
+  const headers = parseCSVLine(lines[0]).map((h) => h.trim());
+  const lowerHeaders = headers.map((h) => h.toLowerCase());
 
   console.log(`📊 CSV has ${(lines.length - 1).toLocaleString()} rows, ${headers.length} columns`);
   console.log(`   Headers: ${headers.slice(0, 8).join(", ")}${headers.length > 8 ? "..." : ""}`);
 
   // Find column indices
   const idx = {
-    buyerType: lowerHeaders.findIndex(h => h.includes("buyer") && h.includes("type")),
-    category: lowerHeaders.findIndex(h => h.includes("category") && !h.includes("sub")),
-    subcategory: lowerHeaders.findIndex(h => h.includes("subcategory")),
-    channel: lowerHeaders.findIndex(h => h === "channel"),
-    // FIX: Use flexible matching for zip column (handles "Zip Code", "zip", etc.)
-    zip: lowerHeaders.findIndex(h => h === "zip" || h === "zip code" || h.includes("zip")),
-    measureNames: lowerHeaders.findIndex(h => h.includes("measure") && h.includes("name")),
-    measureValues: lowerHeaders.findIndex(h => h.includes("measure") && h.includes("value")),
+    buyerType: lowerHeaders.findIndex((h) => h.includes("buyer") && h.includes("type")),
+    category: lowerHeaders.findIndex((h) => h.includes("category") && !h.includes("sub")),
+    subcategory: lowerHeaders.findIndex((h) => h.includes("subcategory")),
+    channel: lowerHeaders.findIndex((h) => h === "channel"),
+    // Flexible matching for zip column (handles "Zip Code", "zip", etc.)
+    zip: lowerHeaders.findIndex((h) => h === "zip" || h === "zip code" || h.includes("zip")),
+    measureNames: lowerHeaders.findIndex((h) => h.includes("measure") && h.includes("name")),
+    measureValues: lowerHeaders.findIndex((h) => h.includes("measure") && h.includes("value")),
   };
 
-  console.log(`   Column indices: zip=${idx.zip}, category=${idx.category}, measureNames=${idx.measureNames}, measureValues=${idx.measureValues}`);
+  console.log(
+    `   Column indices: zip=${idx.zip}, category=${idx.category}, measureNames=${idx.measureNames}, measureValues=${idx.measureValues}`
+  );
 
   // Check for required columns
   if (idx.zip === -1) {
@@ -224,17 +228,18 @@ function pivotCSVData(csv: string): Record[] {
     return [];
   }
   if (idx.measureNames === -1 || idx.measureValues === -1) {
-    console.log(`   ❌ Missing Measure Names/Values columns`);
+    console.log("   ❌ Missing Measure Names/Values columns");
     return [];
   }
   if (idx.category === -1) {
-    console.log(`   ⚠️ Missing 'category' column - will use 'Unknown'`);
+    console.log("   ⚠️ Missing 'category' column - will use 'Unknown'");
   }
 
   // Group by composite key
-  const grouped = new Map<string, { base: Partial<Record>; measures: Map<string, number> }>();
+  const grouped = new Map<string, { base: Partial<CoverageZipRecord>; measures: Map<string, number> }>();
 
   let processedRows = 0;
+
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
@@ -306,7 +311,7 @@ function pivotCSVData(csv: string): Record[] {
 // DATABASE
 // =============================================================================
 
-async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<number> {
+async function upsertRecords(sql: postgres.Sql, records: CoverageZipRecord[]): Promise<number> {
   if (records.length === 0) return 0;
 
   console.log(`💾 Upserting ${records.length.toLocaleString()} records in batches of ${config.batchSize}...`);
@@ -317,11 +322,26 @@ async function upsertRecords(sql: postgres.Sql, records: Record[]): Promise<numb
     const batch = records.slice(i, i + config.batchSize);
 
     await sql`
-      INSERT INTO single_coverage_zips_raw ${sql(batch,
-        'buyer_type', 'category', 'subcategory', 'channel', 'zip',
-        'u_ec', 'r_ec', 'm_ec', 'r_leads', 'u_leads', 'legs',
-        'lead_rev_scrubbed', 'click_rev', 'cmp_bid', 'cmp_bid_per_mec',
-        'conv_percent', 'price', 'clicks_lmp'
+      INSERT INTO single_coverage_zips_raw ${sql(
+        batch,
+        "buyer_type",
+        "category",
+        "subcategory",
+        "channel",
+        "zip",
+        "u_ec",
+        "r_ec",
+        "m_ec",
+        "r_leads",
+        "u_leads",
+        "legs",
+        "lead_rev_scrubbed",
+        "click_rev",
+        "cmp_bid",
+        "cmp_bid_per_mec",
+        "conv_percent",
+        "price",
+        "clicks_lmp"
       )}
       ON CONFLICT (buyer_type, category, subcategory, channel, zip)
       DO UPDATE SET
@@ -375,7 +395,7 @@ async function main() {
     }
 
     // 3. Pivot the data
-    console.log(`\n🔄 Pivoting data...`);
+    console.log("\n🔄 Pivoting data...");
     const records = pivotCSVData(csv);
 
     if (records.length === 0) {
@@ -384,31 +404,32 @@ async function main() {
     }
 
     // 4. Upsert to database
-    console.log(`\n💾 Writing to database...`);
+    console.log("\n💾 Writing to database...");
     const count = await upsertRecords(sql, records);
 
     console.log(`\n${"=".repeat(50)}`);
-    console.log(`🎉 Extraction complete!`);
+    console.log("🎉 Extraction complete!");
     console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
 
-    // 5. Trigger ZIP enrichment via API
-    console.log(`\n🔍 Triggering ZIP code enrichment...`);
-    const enrichResponse = await fetch(`${process.env.APP_BASE_URL}/_api/single-coverage-zips/enrich`, {
+    // After all CSV data is inserted into single_coverage_zips_raw
+    console.log("Triggering ZIP code enrichment...");
+
+    const enrichResponse = await fetch(`${BASE_URL}/_api/single-coverage-zips/enrich`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.EXTRACTION_API_KEY}`,
+        "X-API-Key": process.env.EXTRACTION_API_KEY!,
         "Content-Type": "application/json",
       },
     });
 
-if (enrichResponse.ok) {
-  const enrichResult = await enrichResponse.json();
-  console.log(`✅ Enrichment complete: ${enrichResult.zipsLookedUp} ZIPs looked up, ${enrichResult.recordsEnriched} records updated`);
-} else {
-  console.warn(`⚠️ Enrichment call failed: ${enrichResponse.status}`);
-}
-
+    if (!enrichResponse.ok) {
+      const errorText = await enrichResponse.text();
+      console.error("ZIP enrichment failed:", errorText);
+    } else {
+      const enrichResult = await enrichResponse.json();
+      console.log("ZIP enrichment complete:", enrichResult);
+    }
   } finally {
     // Cleanup
     if (auth) await signOutTableau(auth.token);
