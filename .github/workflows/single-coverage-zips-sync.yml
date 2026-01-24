@@ -22,8 +22,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd scripts/single-coverage-zips
-          npm ci
+         cd scripts/single-coverage-zips
+         npm install
 
       - name: Run extraction
         env:
