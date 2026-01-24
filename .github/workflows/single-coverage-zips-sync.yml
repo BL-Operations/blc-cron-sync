@@ -4,7 +4,7 @@ on:
   schedule:
     # Run every 4 hours
     - cron: '0 */4 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Allow manual trigger
 
 jobs:
   sync:
@@ -22,8 +22,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-         cd scripts/single-coverage-zips
-         npm install
+          cd scripts/single-coverage-zips
+          npm install
 
       - name: Run extraction
         env:
