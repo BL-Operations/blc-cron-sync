@@ -32,6 +32,8 @@ jobs:
           TABLEAU_PAT_SECRET: ${{ secrets.TABLEAU_PAT_SECRET }}
           TABLEAU_VIEW_SBC_ID: ${{ secrets.TABLEAU_VIEW_SBC_ID }}
           SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+          BASE_URL: ${{ secrets.BASE_URL }}
+          EXTRACTION_API_KEY: ${{ secrets.EXTRACTION_API_KEY }}
         run: |
           cd scripts/single-coverage-zips
           npx tsx extract.ts
