@@ -3,9 +3,7 @@ import postgres from "postgres";
 // =======================================================================
 // CONFIGURATION
 // =======================================================================
-
 const BASE_URL = process.env.BASE_URL!;
-
 const config = {
   tableau: {
     serverUrl: process.env.TABLEAU_SERVER_URL!,
@@ -31,7 +29,6 @@ if (!BASE_URL) throw new Error("Missing BASE_URL");
 // =======================================================================
 // TABLEAU API
 // =======================================================================
-
 type TableauAuth = { token: string; siteId: string };
 
 async function authenticateTableau(): Promise<TableauAuth> {
@@ -93,18 +90,15 @@ async function queryViewData(auth: TableauAuth, viewId: string): Promise<string>
   const csv = await response.text();
   console.log(`✅ Downloaded ${csv.length.toLocaleString()} characters`);
 
-  // Strip leading blank lines
   const lines = csv.split(/\r?\n/);
   const firstNonEmpty = lines.findIndex((line) => line.trim() !== "");
   if (firstNonEmpty === -1) return "";
-
   return lines.slice(firstNonEmpty).join("\n");
 }
 
 // =======================================================================
 // CSV PARSING
 // =======================================================================
-
 function parseCSVLine(text: string): string[] {
   const result: string[] = [];
   let cur = "";
@@ -112,7 +106,6 @@ function parseCSVLine(text: string): string[] {
 
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
-
     if (inQuote) {
       if (char === '"') {
         if (i + 1 < text.length && text[i + 1] === '"') {
@@ -135,7 +128,6 @@ function parseCSVLine(text: string): string[] {
       }
     }
   }
-
   result.push(cur);
   return result;
 }
@@ -149,52 +141,47 @@ function parseNumeric(value: string | undefined): number | null {
 }
 
 // =======================================================================
-// DATA TRANSFORMATION
+// STATE ABBREVIATIONS
 // =======================================================================
-
-const MEASURE_MAP: Record<string, string> = {
-  uec: "u_ec",
-  rec: "r_ec",
-  mec: "m_ec",
-  rleads: "r_leads",
-  uleads: "u_leads",
-  legs: "legs",
-  "clicks lmp": "clicks_lmp",
-  "cmp bid": "cmp_bid",
+const STATE_NAME_TO_ABBREV: Record<string, string> = {
+  alabama: "AL", alaska: "AK", arizona: "AZ", arkansas: "AR", california: "CA",
+  colorado: "CO", connecticut: "CT", delaware: "DE", florida: "FL", georgia: "GA",
+  hawaii: "HI", idaho: "ID", illinois: "IL", indiana: "IN", iowa: "IA",
+  kansas: "KS", kentucky: "KY", louisiana: "LA", maine: "ME", maryland: "MD",
+  massachusetts: "MA", michigan: "MI", minnesota: "MN", mississippi: "MS", missouri: "MO",
+  montana: "MT", nebraska: "NE", nevada: "NV", "new hampshire": "NH", "new jersey": "NJ",
+  "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND",
+  ohio: "OH", oklahoma: "OK", oregon: "OR", pennsylvania: "PA", "rhode island": "RI",
+  "south carolina": "SC", "south dakota": "SD", tennessee: "TN", texas: "TX", utah: "UT",
+  vermont: "VT", virginia: "VA", washington: "WA", "west virginia": "WV",
+  wisconsin: "WI", wyoming: "WY", "district of columbia": "DC",
 };
 
-function mapMeasureName(name: string): string | null {
-  const normalized = name.trim().toLowerCase();
-
-  if (MEASURE_MAP[normalized]) return MEASURE_MAP[normalized];
-  if (normalized.includes("lead") && normalized.includes("rev")) return "lead_rev_scrubbed";
-  if (normalized.includes("click") && normalized.includes("rev")) return "click_rev";
-  if (normalized.includes("cmp") && normalized.includes("bid") && normalized.includes("mec")) return "cmp_bid_per_mec";
-  if (normalized.includes("conv") && normalized.includes("%")) return "conv_percent";
-  if (normalized.includes("price")) return "price";
-
-  return null;
+function normalizeState(state: string | null): string | null {
+  if (!state) return null;
+  const trimmed = state.trim();
+  if (trimmed.length === 2) return trimmed.toUpperCase();
+  const abbrev = STATE_NAME_TO_ABBREV[trimmed.toLowerCase()];
+  return abbrev || trimmed.substring(0, 2).toUpperCase();
 }
 
+// =======================================================================
+// DATA TRANSFORMATION (Updated for current schema)
+// =======================================================================
 type CoverageZipRecord = {
-  buyer_type: string | null;
+  lead_buyer: string;
+  lead_buy_campaign: string | null;
   category: string;
-  subcategory: string | null;
-  channel: string | null;
   zip: string;
-  u_ec: number | null;
-  r_ec: number | null;
-  m_ec: number | null;
-  r_leads: number | null;
-  u_leads: number | null;
-  legs: number | null;
-  lead_rev_scrubbed: number | null;
-  click_rev: number | null;
-  cmp_bid: number | null;
-  cmp_bid_per_mec: number | null;
-  conv_percent: number | null;
-  price: number | null;
-  clicks_lmp: number | null;
+  city: string | null;
+  country: string | null;
+  county: string | null;
+  dma: string | null;
+  state: string | null;
+  vertical: string | null;
+  max_bid: number | null;
+  num_lead_buyers: number | null;
+  num_lead_buy_campaigns: number | null;
 };
 
 function pivotCSVData(csv: string): CoverageZipRecord[] {
@@ -205,73 +192,85 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
   const lowerHeaders = headers.map((h) => h.toLowerCase());
 
   console.log(`📊 CSV has ${(lines.length - 1).toLocaleString()} rows, ${headers.length} columns`);
-  console.log(`   Headers: ${headers.slice(0, 8).join(", ")}${headers.length > 8 ? "..." : ""}`);
+  console.log(`   Headers: ${headers.join(", ")}`);
 
-  // Find column indices
+  // Find column indices - map to current schema
   const idx = {
     buyerType: lowerHeaders.findIndex((h) => h.includes("buyer") && h.includes("type")),
     category: lowerHeaders.findIndex((h) => h.includes("category") && !h.includes("sub")),
-    subcategory: lowerHeaders.findIndex((h) => h.includes("subcategory")),
     channel: lowerHeaders.findIndex((h) => h === "channel"),
-    // Flexible matching for zip column (handles "Zip Code", "zip", etc.)
+    county: lowerHeaders.findIndex((h) => h === "county"),
+    state: lowerHeaders.findIndex((h) => h === "state"),
     zip: lowerHeaders.findIndex((h) => h === "zip" || h === "zip code" || h.includes("zip")),
     measureNames: lowerHeaders.findIndex((h) => h.includes("measure") && h.includes("name")),
     measureValues: lowerHeaders.findIndex((h) => h.includes("measure") && h.includes("value")),
   };
 
-  console.log(
-    `   Column indices: zip=${idx.zip}, category=${idx.category}, measureNames=${idx.measureNames}, measureValues=${idx.measureValues}`
-  );
+  console.log(`   Column indices: zip=${idx.zip}, category=${idx.category}, buyerType=${idx.buyerType}, channel=${idx.channel}`);
 
-  // Check for required columns
   if (idx.zip === -1) {
     console.log(`   ❌ Missing 'zip' column. Available: ${headers.join(", ")}`);
     return [];
   }
-  if (idx.measureNames === -1 || idx.measureValues === -1) {
-    console.log("   ❌ Missing Measure Names/Values columns");
+
+  if (idx.buyerType === -1) {
+    console.log(`   ❌ Missing 'Buyer Type' column (maps to lead_buyer)`);
     return [];
   }
-  if (idx.category === -1) {
-    console.log("   ⚠ Missing 'category' column - will use 'Unknown'");
-  }
 
-  // Group by composite key
-  const grouped = new Map<string, { base: Partial<CoverageZipRecord>; measures: Map<string, number> }>();
+  // Group by composite key: (lead_buyer, lead_buy_campaign, category, zip)
+  const grouped = new Map<string, { base: Partial<CoverageZipRecord>; maxBid: number | null }>();
 
   let processedRows = 0;
-
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
     const row = parseCSVLine(line);
+
     const zip = row[idx.zip]?.trim();
     if (!zip) continue;
 
+    const leadBuyer = row[idx.buyerType]?.trim() || "Unknown";
     const category = idx.category !== -1 ? row[idx.category]?.trim() || "Unknown" : "Unknown";
-    const buyerType = idx.buyerType !== -1 ? row[idx.buyerType]?.trim() || null : null;
-    const subcategory = idx.subcategory !== -1 ? row[idx.subcategory]?.trim() || null : null;
-    const channel = idx.channel !== -1 ? row[idx.channel]?.trim() || null : null;
+    const leadBuyCampaign = idx.channel !== -1 ? row[idx.channel]?.trim() || null : null;
+    const county = idx.county !== -1 ? row[idx.county]?.trim() || null : null;
+    const state = idx.state !== -1 ? normalizeState(row[idx.state]) : null;
 
-    const key = `${buyerType}|${category}|${subcategory}|${channel}|${zip}`;
+    const key = `${leadBuyer}|${leadBuyCampaign || ""}|${category}|${zip}`;
 
     if (!grouped.has(key)) {
       grouped.set(key, {
-        base: { buyer_type: buyerType, category, subcategory, channel, zip },
-        measures: new Map(),
+        base: {
+          lead_buyer: leadBuyer,
+          lead_buy_campaign: leadBuyCampaign,
+          category,
+          zip,
+          city: null,
+          country: null,
+          county,
+          dma: null,
+          state,
+          vertical: null,
+          num_lead_buyers: null,
+          num_lead_buy_campaigns: null,
+        },
+        maxBid: null,
       });
     }
 
-    const measureName = row[idx.measureNames]?.trim();
-    const measureValue = row[idx.measureValues]?.trim();
+    // Extract max_bid from measures if available
+    if (idx.measureNames !== -1 && idx.measureValues !== -1) {
+      const measureName = row[idx.measureNames]?.trim().toLowerCase() || "";
+      const measureValue = row[idx.measureValues]?.trim();
 
-    if (measureName && measureValue) {
-      const col = mapMeasureName(measureName);
-      if (col) {
-        const num = parseNumeric(measureValue);
-        if (num !== null) {
-          grouped.get(key)!.measures.set(col, num);
+      if (measureName.includes("cmp") && measureName.includes("bid")) {
+        const bid = parseNumeric(measureValue);
+        if (bid !== null) {
+          const existing = grouped.get(key)!;
+          if (existing.maxBid === null || bid > existing.maxBid) {
+            existing.maxBid = bid;
+          }
         }
       }
     }
@@ -286,84 +285,67 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
   console.log(`   Grouped into ${grouped.size.toLocaleString()} unique records`);
 
   // Convert to flat records
-  return Array.from(grouped.values()).map(({ base, measures }) => ({
-    buyer_type: base.buyer_type ?? null,
+  return Array.from(grouped.values()).map(({ base, maxBid }) => ({
+    lead_buyer: base.lead_buyer!,
+    lead_buy_campaign: base.lead_buy_campaign ?? null,
     category: base.category!,
-    subcategory: base.subcategory ?? null,
-    channel: base.channel ?? null,
     zip: base.zip!,
-    u_ec: measures.get("u_ec") ?? null,
-    r_ec: measures.get("r_ec") ?? null,
-    m_ec: measures.get("m_ec") ?? null,
-    r_leads: measures.get("r_leads") ?? null,
-    u_leads: measures.get("u_leads") ?? null,
-    legs: measures.get("legs") ?? null,
-    lead_rev_scrubbed: measures.get("lead_rev_scrubbed") ?? null,
-    click_rev: measures.get("click_rev") ?? null,
-    cmp_bid: measures.get("cmp_bid") ?? null,
-    cmp_bid_per_mec: measures.get("cmp_bid_per_mec") ?? null,
-    conv_percent: measures.get("conv_percent") ?? null,
-    price: measures.get("price") ?? null,
-    clicks_lmp: measures.get("clicks_lmp") ?? null,
+    city: base.city ?? null,
+    country: base.country ?? null,
+    county: base.county ?? null,
+    dma: base.dma ?? null,
+    state: base.state ?? null,
+    vertical: base.vertical ?? null,
+    max_bid: maxBid,
+    num_lead_buyers: base.num_lead_buyers ?? null,
+    num_lead_buy_campaigns: base.num_lead_buy_campaigns ?? null,
   }));
 }
 
 // =======================================================================
 // DATABASE
 // =======================================================================
-
 async function upsertRecords(sql: postgres.Sql, records: CoverageZipRecord[]): Promise<number> {
   if (records.length === 0) return 0;
 
   console.log(`💾 Upserting ${records.length.toLocaleString()} records in batches of ${config.batchSize}...`);
 
   let upserted = 0;
-
   for (let i = 0; i < records.length; i += config.batchSize) {
     const batch = records.slice(i, i + config.batchSize);
 
     await sql`
       INSERT INTO single_coverage_zips_raw ${sql(
         batch,
-        "buyer_type",
+        "lead_buyer",
+        "lead_buy_campaign",
         "category",
-        "subcategory",
-        "channel",
         "zip",
-        "u_ec",
-        "r_ec",
-        "m_ec",
-        "r_leads",
-        "u_leads",
-        "legs",
-        "lead_rev_scrubbed",
-        "click_rev",
-        "cmp_bid",
-        "cmp_bid_per_mec",
-        "conv_percent",
-        "price",
-        "clicks_lmp"
+        "city",
+        "country",
+        "county",
+        "dma",
+        "state",
+        "vertical",
+        "max_bid",
+        "num_lead_buyers",
+        "num_lead_buy_campaigns"
       )}
-      ON CONFLICT (buyer_type, category, subcategory, channel, zip)
+      ON CONFLICT (lead_buyer, lead_buy_campaign, category, zip)
       DO UPDATE SET
-        u_ec = EXCLUDED.u_ec,
-        r_ec = EXCLUDED.r_ec,
-        m_ec = EXCLUDED.m_ec,
-        r_leads = EXCLUDED.r_leads,
-        u_leads = EXCLUDED.u_leads,
-        legs = EXCLUDED.legs,
-        lead_rev_scrubbed = EXCLUDED.lead_rev_scrubbed,
-        click_rev = EXCLUDED.click_rev,
-        cmp_bid = EXCLUDED.cmp_bid,
-        cmp_bid_per_mec = EXCLUDED.cmp_bid_per_mec,
-        conv_percent = EXCLUDED.conv_percent,
-        price = EXCLUDED.price,
-        clicks_lmp = EXCLUDED.clicks_lmp,
+        city = EXCLUDED.city,
+        country = EXCLUDED.country,
+        county = EXCLUDED.county,
+        dma = EXCLUDED.dma,
+        state = EXCLUDED.state,
+        vertical = EXCLUDED.vertical,
+        max_bid = EXCLUDED.max_bid,
+        num_lead_buyers = EXCLUDED.num_lead_buyers,
+        num_lead_buy_campaigns = EXCLUDED.num_lead_buy_campaigns,
         updated_at = NOW()
     `;
 
     upserted += batch.length;
-
     if (upserted % 10000 === 0) {
       console.log(`   Upserted ${upserted.toLocaleString()} records...`);
     }
@@ -375,7 +357,6 @@ async function upsertRecords(sql: postgres.Sql, records: CoverageZipRecord[]): P
 // =======================================================================
 // MAIN
 // =======================================================================
-
 async function main() {
   console.log("🚀 Starting Single Coverage Zips extraction");
   console.log(`   View ID: ${config.tableau.viewId}`);
@@ -384,27 +365,21 @@ async function main() {
   let auth: TableauAuth | null = null;
 
   try {
-    // 1. Authenticate
     auth = await authenticateTableau();
 
-    // 2. Download ALL data (no category filter)
     const csv = await queryViewData(auth, config.tableau.viewId);
-
     if (!csv || csv.length < 100) {
       console.log("⚠ Empty or minimal response from Tableau. Exiting.");
       return;
     }
 
-    // 3. Pivot the data
     console.log("\n🔄 Pivoting data...");
     const records = pivotCSVData(csv);
-
     if (records.length === 0) {
       console.log("⚠ No records after pivot. Exiting.");
       return;
     }
 
-    // 4. Upsert to database
     console.log("\n💾 Writing to database...");
     const count = await upsertRecords(sql, records);
 
@@ -413,9 +388,8 @@ async function main() {
     console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
 
-    // 5. Trigger ZIP code enrichment
-    console.log("Triggering ZIP code enrichment...");
-
+    // Trigger ZIP code enrichment
+    console.log("\n🌍 Triggering ZIP code enrichment...");
     const enrichResponse = await fetch(`${BASE_URL}/_api/single-coverage-zips/enrich`, {
       method: "POST",
       headers: {
@@ -432,7 +406,6 @@ async function main() {
       console.log("✅ ZIP enrichment complete:", enrichResult);
     }
   } finally {
-    // Cleanup
     if (auth) await signOutTableau(auth.token);
     await sql.end();
   }
