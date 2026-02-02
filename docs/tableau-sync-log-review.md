@@ -20,7 +20,7 @@
 
 ## Runner pickup issue (separate from processing failure)
 - A later run shows the job stuck in the GitHub Actions queue: the workflow evaluates `success()` and repeatedly logs “Waiting for a runner to pick up this job…” for `ubuntu-latest`.
-- This indicates a hosted runner capacity/queue issue rather than a problem inside the workflow steps.
+- This points to a hosted runner capacity/queue issue rather than a problem inside the workflow steps, so it should be debugged independently from the stack-depth failures.
 
 ## Runner troubleshooting next checks
 1. Inspect the org/repo Actions usage and concurrency limits to see if the hosted runner pool is saturated.
