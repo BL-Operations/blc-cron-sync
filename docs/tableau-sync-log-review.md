@@ -27,6 +27,9 @@
 2. Reduce schedule frequency or enable a concurrency group to avoid stacking queued runs.
 3. Consider pinning to a specific Ubuntu version or using a self-hosted runner if the queue persists.
 
+## Conflict resolution note
+- The runner pickup section above is intended to remain in this document, and any merge conflict markers should be removed so the file reads cleanly end-to-end.
+
 ## Evidence (excerpted from the run output)
 - Fetched 456,060 raw rows and grouped into 15,497 unique records.
 - Main processing completed with -3 processed and 15,500 failed.
