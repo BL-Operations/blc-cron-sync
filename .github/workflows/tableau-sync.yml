@@ -2,15 +2,15 @@ name: Tableau Sync
 
 on:
   schedule:
-    # Runs every hour at minute 0 (adjust as needed)
-    - cron: '*/10 * * * *'
-  workflow_dispatch:  # Allows manual trigger from GitHub UI
+    # 7:00 AM MDT = 13:00 UTC (MDT is UTC-6)
+    - cron: '0 14 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # Adjust based on how long your sync takes
-    
+    timeout-minutes: 10 # Adjust based on how long your sync takes
+
     steps:
       - name: Trigger Tableau Sync
         id: sync
