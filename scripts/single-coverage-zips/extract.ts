@@ -63,10 +63,13 @@ async function authenticateTableau(): Promise<TableauAuth> {
 
 async function signOutTableau(token: string): Promise<void> {
   try {
-    await fetch(`${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/auth/signout`, {
-      method: "POST",
-      headers: { "X-Tableau-Auth": token },
-    });
+    await fetch(
+      `${config.tableau.serverUrl}/api/${config.tableau.apiVersion}/auth/signout`,
+      {
+        method: "POST",
+        headers: { "X-Tableau-Auth": token },
+      }
+    );
     console.log("🚪 Signed out from Tableau");
   } catch (e) {
     console.warn("Sign out warning:", e);
@@ -166,7 +169,7 @@ function normalizeState(state: string | null): string | null {
 }
 
 // =======================================================================
-// DATA TRANSFORMATION (Updated for current schema)
+// DATA TRANSFORMATION (Flat view: Campaign Coverage List for Jonathan)
 // =======================================================================
 type CoverageZipRecord = {
   lead_buyer: string;
@@ -184,44 +187,73 @@ type CoverageZipRecord = {
   num_lead_buy_campaigns: number | null;
 };
 
-function pivotCSVData(csv: string): CoverageZipRecord[] {
+function parseCSVData(csv: string): CoverageZipRecord[] {
   const lines = csv.split(/\r?\n/);
   if (lines.length < 2) return [];
 
   const headers = parseCSVLine(lines[0]).map((h) => h.trim());
   const lowerHeaders = headers.map((h) => h.toLowerCase());
 
-  console.log(`📊 CSV has ${(lines.length - 1).toLocaleString()} rows, ${headers.length} columns`);
+  console.log(
+    `📊 CSV has ${(lines.length - 1).toLocaleString()} rows, ${headers.length} columns`
+  );
   console.log(`   Headers: ${headers.join(", ")}`);
 
-  // Find column indices - map to current schema
+  // Map columns to the flat "Campaign Coverage List for Jonathan" view
   const idx = {
-    buyerType: lowerHeaders.findIndex((h) => h.includes("buyer") && h.includes("type")),
-    category: lowerHeaders.findIndex((h) => h.includes("category") && !h.includes("sub")),
-    channel: lowerHeaders.findIndex((h) => h === "channel"),
+    buyerAccount: lowerHeaders.findIndex(
+      (h) => h.includes("buyer") && h.includes("account")
+    ),
+    category: lowerHeaders.findIndex(
+      (h) => h === "category" || (h.includes("category") && !h.includes("sub"))
+    ),
+    campaign: lowerHeaders.findIndex((h) => h === "campaign"),
     county: lowerHeaders.findIndex((h) => h === "county"),
     state: lowerHeaders.findIndex((h) => h === "state"),
-    zip: lowerHeaders.findIndex((h) => h === "zip" || h === "zip code" || h.includes("zip")),
-    measureNames: lowerHeaders.findIndex((h) => h.includes("measure") && h.includes("name")),
-    measureValues: lowerHeaders.findIndex((h) => h.includes("measure") && h.includes("value")),
+    zip: lowerHeaders.findIndex((h) => h === "zip"),
+    city: lowerHeaders.findIndex((h) => h === "city"),
+    country: lowerHeaders.findIndex((h) => h === "country"),
+    dma: lowerHeaders.findIndex((h) => h === "dma"),
+    vertical: lowerHeaders.findIndex((h) => h === "vertical"),
+    numBuyers: lowerHeaders.findIndex(
+      (h) => h.includes("#") && h.includes("buyer")
+    ),
+    campaignBid: lowerHeaders.findIndex(
+      (h) => h.includes("campaign") && h.includes("bid")
+    ),
   };
 
-  console.log(`   Column indices: zip=${idx.zip}, category=${idx.category}, buyerType=${idx.buyerType}, channel=${idx.channel}`);
+  console.log(`   Column indices:`, JSON.stringify(idx));
 
+  // Validate required columns
   if (idx.zip === -1) {
-    console.log(`   ❌ Missing 'zip' column. Available: ${headers.join(", ")}`);
+    console.log(
+      `   ❌ Missing 'Zip' column. Available: ${headers.join(", ")}`
+    );
     return [];
   }
-
-  if (idx.buyerType === -1) {
-    console.log(`   ❌ Missing 'Buyer Type' column (maps to lead_buyer)`);
+  if (idx.buyerAccount === -1) {
+    console.log(
+      `   ❌ Missing 'Buyer Account' column. Available: ${headers.join(", ")}`
+    );
+    return [];
+  }
+  if (idx.category === -1) {
+    console.log(
+      `   ❌ Missing 'Category' column. Available: ${headers.join(", ")}`
+    );
     return [];
   }
 
   // Group by composite key: (lead_buyer, lead_buy_campaign, category, zip)
-  const grouped = new Map<string, { base: Partial<CoverageZipRecord>; maxBid: number | null }>();
+  const grouped = new Map<
+    string,
+    { base: Partial<CoverageZipRecord>; maxBid: number | null }
+  >();
 
   let processedRows = 0;
+  let skippedRows = 0;
+
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
@@ -229,13 +261,27 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
     const row = parseCSVLine(line);
 
     const zip = row[idx.zip]?.trim();
-    if (!zip) continue;
+    if (!zip) {
+      skippedRows++;
+      continue;
+    }
 
-    const leadBuyer = row[idx.buyerType]?.trim() || "Unknown";
-    const category = idx.category !== -1 ? row[idx.category]?.trim() || "Unknown" : "Unknown";
-    const leadBuyCampaign = idx.channel !== -1 ? row[idx.channel]?.trim() || null : null;
+    const leadBuyer = row[idx.buyerAccount]?.trim() || "Unknown";
+    const category = row[idx.category]?.trim() || "Unknown";
+    const leadBuyCampaign =
+      idx.campaign !== -1 ? row[idx.campaign]?.trim() || null : null;
     const county = idx.county !== -1 ? row[idx.county]?.trim() || null : null;
     const state = idx.state !== -1 ? normalizeState(row[idx.state]) : null;
+    const city = idx.city !== -1 ? row[idx.city]?.trim() || null : null;
+    const country =
+      idx.country !== -1 ? row[idx.country]?.trim() || null : null;
+    const dma = idx.dma !== -1 ? row[idx.dma]?.trim() || null : null;
+    const vertical =
+      idx.vertical !== -1 ? row[idx.vertical]?.trim() || null : null;
+    const numBuyers =
+      idx.numBuyers !== -1 ? parseNumeric(row[idx.numBuyers]) : null;
+    const campaignBid =
+      idx.campaignBid !== -1 ? parseNumeric(row[idx.campaignBid]) : null;
 
     const key = `${leadBuyer}|${leadBuyCampaign || ""}|${category}|${zip}`;
 
@@ -246,31 +292,32 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
           lead_buy_campaign: leadBuyCampaign,
           category,
           zip,
-          city: null,
-          country: null,
+          city,
+          country,
           county,
-          dma: null,
+          dma,
           state,
-          vertical: null,
-          num_lead_buyers: null,
+          vertical,
+          num_lead_buyers:
+            numBuyers !== null ? Math.round(numBuyers) : null,
           num_lead_buy_campaigns: null,
         },
-        maxBid: null,
+        maxBid: campaignBid,
       });
-    }
-
-    // Extract max_bid from measures if available
-    if (idx.measureNames !== -1 && idx.measureValues !== -1) {
-      const measureName = row[idx.measureNames]?.trim().toLowerCase() || "";
-      const measureValue = row[idx.measureValues]?.trim();
-
-      if (measureName.includes("cmp") && measureName.includes("bid")) {
-        const bid = parseNumeric(measureValue);
-        if (bid !== null) {
-          const existing = grouped.get(key)!;
-          if (existing.maxBid === null || bid > existing.maxBid) {
-            existing.maxBid = bid;
-          }
+    } else {
+      // If duplicate key, keep the highest bid
+      const existing = grouped.get(key)!;
+      if (
+        campaignBid !== null &&
+        (existing.maxBid === null || campaignBid > existing.maxBid)
+      ) {
+        existing.maxBid = campaignBid;
+      }
+      // Keep the highest num_lead_buyers
+      if (numBuyers !== null) {
+        const existingNum = existing.base.num_lead_buyers;
+        if (existingNum === null || Math.round(numBuyers) > existingNum) {
+          existing.base.num_lead_buyers = Math.round(numBuyers);
         }
       }
     }
@@ -281,8 +328,12 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
     }
   }
 
-  console.log(`   Processed ${processedRows.toLocaleString()} total rows`);
-  console.log(`   Grouped into ${grouped.size.toLocaleString()} unique records`);
+  console.log(
+    `   Processed ${processedRows.toLocaleString()} total rows, skipped ${skippedRows}`
+  );
+  console.log(
+    `   Grouped into ${grouped.size.toLocaleString()} unique records`
+  );
 
   // Convert to flat records
   return Array.from(grouped.values()).map(({ base, maxBid }) => ({
@@ -305,10 +356,15 @@ function pivotCSVData(csv: string): CoverageZipRecord[] {
 // =======================================================================
 // DATABASE
 // =======================================================================
-async function upsertRecords(sql: postgres.Sql, records: CoverageZipRecord[]): Promise<number> {
+async function upsertRecords(
+  sql: postgres.Sql,
+  records: CoverageZipRecord[]
+): Promise<number> {
   if (records.length === 0) return 0;
 
-  console.log(`💾 Upserting ${records.length.toLocaleString()} records in batches of ${config.batchSize}...`);
+  console.log(
+    `💾 Upserting ${records.length.toLocaleString()} records in batches of ${config.batchSize}...`
+  );
 
   let upserted = 0;
   for (let i = 0; i < records.length; i += config.batchSize) {
@@ -373,12 +429,32 @@ async function main() {
       return;
     }
 
-    console.log("\n🔄 Pivoting data...");
-    const records = pivotCSVData(csv);
+    console.log("\n🔄 Parsing flat CSV data...");
+    const records = parseCSVData(csv);
     if (records.length === 0) {
-      console.log("⚠ No records after pivot. Exiting.");
+      console.log("⚠ No records after parsing. Exiting.");
       return;
     }
+
+    // Log a summary of what we found
+    const categories = new Set(records.map((r) => r.category));
+    const buyers = new Set(records.map((r) => r.lead_buyer));
+    console.log(`   Categories found (${categories.size}): ${[...categories].join(", ")}`);
+    console.log(`   Unique buyers: ${buyers.size}`);
+    console.log(
+      `   Records with num_lead_buyers: ${records.filter((r) => r.num_lead_buyers !== null).length}`
+    );
+    console.log(
+      `   Records with max_bid: ${records.filter((r) => r.max_bid !== null).length}`
+    );
+    console.log(
+      `   Records with campaign: ${records.filter((r) => r.lead_buy_campaign !== null).length}`
+    );
+
+    // Truncate old data from the previous (wrong) view before inserting
+    console.log("\n🗑 Truncating old data from single_coverage_zips_raw...");
+    await sql`TRUNCATE TABLE single_coverage_zips_raw RESTART IDENTITY`;
+    console.log("   Truncated.");
 
     console.log("\n💾 Writing to database...");
     const count = await upsertRecords(sql, records);
@@ -388,15 +464,23 @@ async function main() {
     console.log(`   Total records upserted: ${count.toLocaleString()}`);
     console.log(`${"=".repeat(50)}`);
 
-    // Trigger ZIP code enrichment
+    // Refresh the materialized view so the report picks up new data
+    console.log("\n📊 Refreshing materialized view...");
+    await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY single_buyer_coverage_summary`;
+    console.log("   Materialized view refreshed.");
+
+    // Trigger ZIP code enrichment via Floot endpoint
     console.log("\n🌍 Triggering ZIP code enrichment...");
-    const enrichResponse = await fetch(`${BASE_URL}/_api/single-coverage-zips/enrich`, {
-      method: "POST",
-      headers: {
-        "X-API-Key": process.env.EXTRACTION_API_KEY!,
-        "Content-Type": "application/json",
-      },
-    });
+    const enrichResponse = await fetch(
+      `${BASE_URL}/_api/single-coverage-zips/enrich`,
+      {
+        method: "POST",
+        headers: {
+          "X-API-Key": process.env.EXTRACTION_API_KEY!,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
     if (!enrichResponse.ok) {
       const errorText = await enrichResponse.text();
