@@ -1,0 +1,70 @@
+name: Tableau Data Processing
+
+on:
+  # Run after your Coupler.io import finishes — adjust the cron as needed
+  schedule:
+    - cron: '0 8 * * *'   # Example: daily at 8 AM UTC
+  workflow_dispatch:        # Allow manual trigger
+
+jobs:
+  process-tableau-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30     # Safety net for the whole job
+
+    steps:
+      - name: Process Tableau Raw Data (resumable loop)
+        env:
+          API_KEY: ${{ secrets.EXTRACTION_API_KEY }}
+          API_URL: https://buyerlink-connect.floot.app/_api/tableau-raw-data/process
+        run: |
+          MAX_ITERATIONS=20
+          ITERATION=0
+
+          while [ $ITERATION -lt $MAX_ITERATIONS ]; do
+            ITERATION=$((ITERATION + 1))
+            echo "=== Iteration $ITERATION of $MAX_ITERATIONS ==="
+
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST "$API_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: $API_KEY" \
+              -d '{}' \
+              --max-time 180)
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+
+            echo "Status: $HTTP_CODE"
+            echo "Response: $BODY"
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "::error::API returned status $HTTP_CODE"
+              exit 1
+            fi
+
+            # Check if done (parse the superjson response)
+            # superjson wraps the response in {"json": {...}}
+            DONE=$(echo "$BODY" | jq -r '.json.done // false')
+            NO_DATA=$(echo "$BODY" | jq -r '.json.noDataAvailable // false')
+
+            if [ "$NO_DATA" = "true" ]; then
+              echo "✅ No data to process — tableau_raw_data is empty."
+              exit 0
+            fi
+
+            if [ "$DONE" = "true" ]; then
+              echo "✅ Processing complete!"
+              echo "$BODY" | jq '.json.stats'
+              exit 0
+            fi
+
+            # Not done yet — show progress and continue
+            PHASE=$(echo "$BODY" | jq -r '.json.resumeInfo.phase // "unknown"')
+            PROGRESS=$(echo "$BODY" | jq -r '.json.resumeInfo.progress // "unknown"')
+            echo "⏳ Phase: $PHASE — $PROGRESS"
+            echo "Waiting 5 seconds before next call..."
+            sleep 5
+          done
+
+          echo "::error::Reached max iterations ($MAX_ITERATIONS) without completing"
+          exit 1
