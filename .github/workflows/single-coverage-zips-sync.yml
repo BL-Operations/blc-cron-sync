@@ -3,7 +3,7 @@ name: Single Coverage Zips Sync
 on:
   schedule:
     # 5:00 AM MDT (UTC-6) == 11:00 UTC
-    - cron: '0 11 * * *'
+    - cron: '0 11 1 * *'
   workflow_dispatch:
 
 jobs:
