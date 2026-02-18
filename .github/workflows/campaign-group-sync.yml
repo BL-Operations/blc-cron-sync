@@ -1,0 +1,39 @@
+name: Campaign Group Sync
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sync Campaign Groups
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: ${{ secrets.EXTRACTION_API_KEY }}" \
+            https://buyerlink-connect.floot.app/_api/campaign-groups/sync)
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          
+          echo "Status: $HTTP_CODE"
+          echo "Response: $BODY"
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Sync failed with status $HTTP_CODE"
+            exit 1
+          fi
+          
+          # Check if skipped (no changes)
+          SKIPPED=$(echo "$BODY" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('json',{}).get('skipped', False))" 2>/dev/null || echo "unknown")
+          
+          if [ "$SKIPPED" = "True" ]; then
+            echo "✅ No changes detected — exiting cleanly."
+          else
+            echo "🔄 Sync executed — check response for details."
+          fi
