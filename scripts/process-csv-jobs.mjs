@@ -8,7 +8,6 @@ const CONFIG = {
 };
 
 // --- Utils ---
-
 function getEnv(key) {
   const val = process.env[key];
   if (!val) {
@@ -22,12 +21,13 @@ const dbUrl = getEnv('DATABASE_URL');
 const sfClientId = getEnv('SALESFORCE_OAUTH_CLIENT_ID');
 const sfClientSecret = getEnv('SALESFORCE_OAUTH_CLIENT_SECRET');
 // Token URL might be missing if not set in secrets, provide default
-const sfTokenUrlRaw = process.env['SALESFORCE_OAUTH_TOKEN_URL'] || 'https://login.salesforce.com/services/oauth2/token';
+const sfTokenUrlRaw = process.env['SALESFORCE_OAUTH_TOKEN_URL'] || 
+'https://login.salesforce.com/services/oauth2/token';
 const supabaseApiUrl = getEnv('SUPABASE_API_URL').replace(/\/$/, "");
 const supabaseKey = getEnv('SUPABASE_SERVICE_ROLE_KEY');
 
 const sql = postgres(dbUrl, {
-  ssl: { rejectUnauthorized: false }, // Should be true in strict prod but often false for hosted DBs
+  ssl: { rejectUnauthorized: false },
   idle_timeout: 20,
   max: 5
 });
@@ -47,7 +47,6 @@ function normalizeSfUrl(url) {
 const SF_TOKEN_URL = normalizeSfUrl(sfTokenUrlRaw);
 
 // --- Salesforce Helpers ---
-
 let cachedAccessToken = null;
 let cachedInstanceUrl = null;
 
@@ -58,8 +57,8 @@ async function getSalesforceTokens() {
 
   // Get tokens from DB
   const tokens = await sql`
-    SELECT access_token, refresh_token, instance_url, expires_at 
-    FROM salesforce_oauth_tokens 
+    SELECT access_token, refresh_token, instance_url, expires_at
+    FROM salesforce_oauth_tokens
     ORDER BY created_at DESC LIMIT 1
   `;
 
@@ -106,13 +105,11 @@ async function refreshSalesforceToken(refreshToken, currentInstanceUrl) {
   const data = await response.json();
   const accessToken = data.access_token;
   const instanceUrl = data.instance_url || currentInstanceUrl;
-  
+
   // Update DB
-  // Salesforce usually returns expires_in, but if not we assume 2 hours
   const expiresInSeconds = 2 * 60 * 60;
   const newExpiresAt = new Date(Date.now() + expiresInSeconds * 1000);
 
-  // We delete old and insert new to be safe with single row logic often used
   await sql`DELETE FROM salesforce_oauth_tokens`;
   await sql`
     INSERT INTO salesforce_oauth_tokens (access_token, refresh_token, instance_url, token_type, expires_at)
@@ -121,16 +118,15 @@ async function refreshSalesforceToken(refreshToken, currentInstanceUrl) {
 
   cachedAccessToken = accessToken;
   cachedInstanceUrl = instanceUrl;
-
   console.log("Salesforce token refreshed successfully.");
   return { accessToken, instanceUrl };
 }
 
 async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
   const { accessToken, instanceUrl } = await getSalesforceTokens();
-  
+
   const url = endpoint.startsWith('http') ? endpoint : `${instanceUrl}${endpoint}`;
-  
+
   const headers = {
     'Authorization': `Bearer ${accessToken}`,
     'Content-Type': 'application/json',
@@ -148,7 +144,7 @@ async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
     return salesforceRequest(endpoint, options, retryCount + 1);
   }
 
-    // PATCH returns 204 No Content on success
+  // PATCH returns 204 No Content on success
   if (response.status === 204) {
     return response;
   }
@@ -162,12 +158,10 @@ async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
 }
 
 // --- Supabase Helpers ---
-
 async function downloadChunk(path) {
-  // Remove leading slash
   const cleanPath = path.startsWith("/") ? path.slice(1) : path;
   const url = `${supabaseApiUrl}/storage/v1/object/csv-uploads/${cleanPath}`;
-  
+
   const response = await fetch(url, {
     headers: { 'Authorization': `Bearer ${supabaseKey}` }
   });
@@ -175,14 +169,14 @@ async function downloadChunk(path) {
   if (!response.ok) {
     throw new Error(`Failed to download chunk ${cleanPath}: ${response.statusText}`);
   }
-  
+
   return response.json();
 }
 
 async function deleteChunk(path) {
   const cleanPath = path.startsWith("/") ? path.slice(1) : path;
   const url = `${supabaseApiUrl}/storage/v1/object/csv-uploads/${cleanPath}`;
-  
+
   await fetch(url, {
     method: 'DELETE',
     headers: { 'Authorization': `Bearer ${supabaseKey}` }
@@ -190,7 +184,6 @@ async function deleteChunk(path) {
 }
 
 // --- Main Processing Logic ---
-
 async function main() {
   const forcedJobId = process.argv[2];
   let job;
@@ -203,7 +196,7 @@ async function main() {
     } else {
       console.log("Looking for oldest pending job...");
       [job] = await sql`
-        SELECT * FROM csv_upload_jobs 
+        SELECT * FROM csv_upload_jobs
         WHERE status IN ('pending', 'processing_upsert', 'processing_finalize')
         ORDER BY created_at ASC
         LIMIT 1
@@ -221,11 +214,11 @@ async function main() {
     }
 
     console.log(`Starting processing for job ${job.id} (Status: ${job.status})`);
-    
+
     // 2. Phase 1: UPSERT
     if (['pending', 'processing_upsert'].includes(job.status)) {
       console.log("--- Phase 1: Upsert ---");
-      
+
       if (job.status === 'pending') {
         await sql`UPDATE csv_upload_jobs SET status = 'processing_upsert', updated_at = NOW() WHERE id = ${job.id}`;
       }
@@ -234,7 +227,7 @@ async function main() {
       const numChunks = job.chunk_count || 1;
       const allRows = [];
       console.log(`Downloading ${numChunks} chunks...`);
-      
+
       for (let i = 0; i < numChunks; i++) {
         const chunkPath = `${job.storage_path}_chunk_${i}.json`;
         try {
@@ -250,13 +243,13 @@ async function main() {
 
       // Resume from rows_processed
       let currentIndex = job.rows_processed || 0;
-      
+
       if (currentIndex < allRows.length) {
         console.log(`Resuming from row ${currentIndex}...`);
-        
+
         while (currentIndex < allRows.length) {
           const batchRaw = allRows.slice(currentIndex, currentIndex + CONFIG.BATCH_SIZE);
-          
+
           // Deduplicate batch
           const dedupedMap = new Map();
           for (const r of batchRaw) {
@@ -268,7 +261,7 @@ async function main() {
           // Prepare for insert
           const now = new Date();
           const batchTimestamp = new Date(job.batch_timestamp);
-          
+
           const records = uniqueBatch.map(row => ({
             lead_buyer: row.lead_buyer,
             lead_buy_campaign: row.lead_buy_campaign,
@@ -298,14 +291,14 @@ async function main() {
           }
 
           currentIndex += batchRaw.length;
-          
+
           // Update progress
           await sql`
-            UPDATE csv_upload_jobs 
-            SET rows_processed = ${currentIndex}, updated_at = NOW() 
+            UPDATE csv_upload_jobs
+            SET rows_processed = ${currentIndex}, updated_at = NOW()
             WHERE id = ${job.id}
           `;
-          
+
           if (currentIndex % 10000 === 0) {
             console.log(`Processed ${currentIndex}/${allRows.length} rows...`);
           }
@@ -314,8 +307,8 @@ async function main() {
 
       // Mark upsert complete
       await sql`
-        UPDATE csv_upload_jobs 
-        SET status = 'processing_finalize', updated_at = NOW() 
+        UPDATE csv_upload_jobs
+        SET status = 'processing_finalize', updated_at = NOW()
         WHERE id = ${job.id}
       `;
       job.status = 'processing_finalize';
@@ -325,7 +318,7 @@ async function main() {
     // 3. Phase 2: FINALIZE
     if (job.status === 'processing_finalize') {
       console.log("--- Phase 2: Finalize ---");
-      
+
       const stats = {
         pausedRows: 0,
         groupsCreated: 0,
@@ -337,25 +330,23 @@ async function main() {
       };
 
       // 3a. Pause Stale Rows
-      // Only necessary if skipPauseStep isn't true (we can assume false for full run)
-      // We implement it fully here.
       console.log("Pausing stale rows...");
-      
       const affectedBuyers = job.affected_lead_buyers || [];
+
       if (affectedBuyers.length > 0) {
         const pauseResult = await sql`
           WITH uploaded_combos AS (
-            SELECT DISTINCT 
+            SELECT DISTINCT
               lead_buyer,
               category,
-              CASE 
+              CASE
                 WHEN lead_buy_campaign ILIKE '%branded%' OR lead_buy_campaign ILIKE '%microsite%' 
-                THEN 'Marketplace - Branded' 
-                ELSE 'Marketplace - Standard - HS' 
+                THEN 'Marketplace - Branded'
+                ELSE 'Marketplace - Standard - HS'
               END as derived_product
             FROM single_coverage_zips_raw
             WHERE lead_buyer = ANY(${affectedBuyers})
-            AND job_id = ${job.id}
+              AND job_id = ${job.id}
           ),
           updates AS (
             UPDATE single_coverage_zips_raw r
@@ -363,10 +354,10 @@ async function main() {
             FROM uploaded_combos uc
             WHERE r.lead_buyer = uc.lead_buyer
               AND r.category = uc.category
-              AND (CASE 
+              AND (CASE
                 WHEN r.lead_buy_campaign ILIKE '%branded%' OR r.lead_buy_campaign ILIKE '%microsite%' 
-                THEN 'Marketplace - Branded' 
-                ELSE 'Marketplace - Standard - HS' 
+                THEN 'Marketplace - Branded'
+                ELSE 'Marketplace - Standard - HS'
               END) = uc.derived_product
               AND (r.job_id IS NULL OR r.job_id != ${job.id})
               AND r.campaign_status = 'Active'
@@ -380,19 +371,19 @@ async function main() {
 
       // 3b. Campaign Group Sync
       console.log("Starting Campaign Group Sync...");
-      
+
       const activeCombos = await sql`
-        SELECT DISTINCT 
+        SELECT DISTINCT
           lead_buyer,
           category,
-          CASE 
+          CASE
             WHEN lead_buy_campaign ILIKE '%branded%' OR lead_buy_campaign ILIKE '%microsite%' 
-            THEN 'Marketplace - Branded' 
-            ELSE 'Marketplace - Standard - HS' 
+            THEN 'Marketplace - Branded'
+            ELSE 'Marketplace - Standard - HS'
           END as derived_product
         FROM single_coverage_zips_raw
         WHERE lead_buyer = ANY(${affectedBuyers})
-        AND job_id = ${job.id}
+          AND job_id = ${job.id}
         ORDER BY lead_buyer, category, derived_product
       `;
 
@@ -423,10 +414,10 @@ async function main() {
 
           // Check local tracking
           const [tracked] = await sql`
-            SELECT salesforce_campaign_group_id 
-            FROM campaign_groups_sync_tracking 
-            WHERE salesforce_account_id = ${sfAccountId} 
-              AND product = ${derived_product} 
+            SELECT salesforce_campaign_group_id
+            FROM campaign_groups_sync_tracking
+            WHERE salesforce_account_id = ${sfAccountId}
+              AND product = ${derived_product}
               AND salesforce_category = ${category}
           `;
 
@@ -438,7 +429,7 @@ async function main() {
             const query = `SELECT Id FROM Campaign_Group__c WHERE Account__c = '${sfAccountId}' AND Name = '${campaignGroupName}' LIMIT 1`;
             const sfRes = await salesforceRequest(`/services/data/${CONFIG.SALESFORCE_API_VERSION}/query?q=${encodeURIComponent(query)}`)
               .then(r => r.json());
-            
+
             if (sfRes.records && sfRes.records.length > 0) {
               sfGroupId = sfRes.records[0].Id;
               stats.groupsExisting++;
@@ -468,7 +459,7 @@ async function main() {
             // Update tracking
             if (sfGroupId) {
               await sql`
-                INSERT INTO campaign_groups_sync_tracking 
+                INSERT INTO campaign_groups_sync_tracking
                   (salesforce_account_id, product, salesforce_category, salesforce_campaign_group_id, updated_at)
                 VALUES (${sfAccountId}, ${derived_product}, ${category}, ${sfGroupId}, NOW())
                 ON CONFLICT (salesforce_account_id, product, salesforce_category) 
@@ -485,14 +476,14 @@ async function main() {
             FROM single_coverage_zips_raw
             WHERE lead_buyer = ${lead_buyer}
               AND category = ${category}
-              AND (CASE 
+              AND (CASE
                 WHEN lead_buy_campaign ILIKE '%branded%' OR lead_buy_campaign ILIKE '%microsite%' 
-                THEN 'Marketplace - Branded' 
-                ELSE 'Marketplace - Standard - HS' 
+                THEN 'Marketplace - Branded'
+                ELSE 'Marketplace - Standard - HS'
               END) = ${derived_product}
               AND campaign_status = 'Active'
           `;
-          
+
           // Update SF count
           await salesforceRequest(`/services/data/${CONFIG.SALESFORCE_API_VERSION}/sobjects/Campaign_Group__c/${sfGroupId}`, {
             method: 'PATCH',
@@ -508,10 +499,10 @@ async function main() {
             FROM single_coverage_zips_raw
             WHERE lead_buyer = ${lead_buyer}
               AND category = ${category}
-              AND (CASE 
+              AND (CASE
                 WHEN lead_buy_campaign ILIKE '%branded%' OR lead_buy_campaign ILIKE '%microsite%' 
-                THEN 'Marketplace - Branded' 
-                ELSE 'Marketplace - Standard - HS' 
+                THEN 'Marketplace - Branded'
+                ELSE 'Marketplace - Standard - HS'
               END) = ${derived_product}
           `;
 
@@ -519,7 +510,7 @@ async function main() {
             const header = "zip,city,state,county,dma,max_bid,campaign_status,lead_buy_campaign";
             const csvContent = [
               header,
-              ...rows.map(r => 
+              ...rows.map(r =>
                 [
                   `"${r.zip || ""}"`,
                   `"${r.city || ""}"`,
@@ -547,7 +538,6 @@ async function main() {
               "PathOnClient": fileName,
               "FirstPublishLocationId": sfGroupId
             }) + '\r\n';
-            
             body += `--${boundary}\r\n`;
             body += `Content-Disposition: form-data; name="VersionData"; filename="${fileName}"\r\n`;
             body += `Content-Type: application/octet-stream\r\n\r\n`;
@@ -579,13 +569,13 @@ async function main() {
 
       console.log("Salesforce sync complete.");
 
-      // 3c. Location Enrichment
+      // 3c. Location Enrichment (scoped to current job to prevent deadlocks)
       console.log("Enriching locations...");
       await sql`
         UPDATE single_coverage_zips_raw r
         SET state = z.state, county = z.county, country = 'US'
         FROM zip_code_lookup z
-        WHERE r.zip = z.zip AND r.state IS NULL
+        WHERE r.zip = z.zip AND r.state IS NULL AND r.job_id = ${job.id}
       `;
 
       // 3d. Recalculation
@@ -604,6 +594,7 @@ async function main() {
               GROUP BY zip
             ) sub
             WHERE r.category = ${cat} AND r.zip = sub.zip
+              AND r.job_id = ${job.id}
               AND r.num_lead_buyers IS DISTINCT FROM sub.cnt
           `;
 
@@ -618,6 +609,7 @@ async function main() {
               GROUP BY zip
             ) sub
             WHERE r.category = ${cat} AND r.zip = sub.zip
+              AND r.job_id = ${job.id}
               AND r.num_lead_buy_campaigns IS DISTINCT FROM sub.cnt
           `;
         }
@@ -627,7 +619,7 @@ async function main() {
       // 3e. Clear Cache & Refresh View
       console.log("Clearing cache and refreshing views...");
       await sql`DELETE FROM cache_entries`;
-      
+
       try {
         await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY single_buyer_coverage_summary`;
       } catch (e) {
@@ -653,19 +645,19 @@ async function main() {
         SET status = 'completed', sync_stats = ${JSON.stringify(stats)}, updated_at = NOW()
         WHERE id = ${job.id}
       `;
-      
+
       console.log("Job completed successfully!");
     }
 
-    } catch (error) {
+  } catch (error) {
     console.error("FATAL ERROR:", error);
-    
+
     // Attempt to mark the actual job as failed
     const failJobId = job?.id || process.argv[2];
     if (failJobId) {
       try {
         await sql`
-          UPDATE csv_upload_jobs 
+          UPDATE csv_upload_jobs
           SET status = 'failed', error_message = ${error.message || 'Unknown error'}, updated_at = NOW()
           WHERE id = ${failJobId} AND status NOT IN ('completed', 'failed')
         `;
@@ -674,7 +666,7 @@ async function main() {
         console.error("Failed to mark job as failed:", markError);
       }
     }
-    
+
     process.exit(1);
   } finally {
     await sql.end();
