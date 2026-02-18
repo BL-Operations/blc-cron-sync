@@ -28,7 +28,7 @@ jobs:
           cache-dependency-path: scripts/package.json
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
         working-directory: scripts
 
       - name: Process CSV Jobs
