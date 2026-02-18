@@ -1,0 +1,107 @@
+# .github/workflows/process-csv-jobs.yml
+name: Process Coverage Zips CSV Jobs
+
+on:
+  schedule:
+    # Every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # Manual trigger
+
+env:
+  API_BASE_URL: https://buyerlink-connect.floot.app
+  API_KEY: ${{ secrets.EXTRACTION_API_KEY }}
+
+jobs:
+  process-csv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55 # Stay under the 60-min GitHub Actions limit
+    steps:
+      - name: Process CSV Upload Jobs
+        run: |
+          MAX_ITERATIONS=100
+          ITERATION=0
+          SLEEP_BETWEEN_CALLS=5
+
+          while [ $ITERATION -lt $MAX_ITERATIONS ]; do
+            ITERATION=$((ITERATION + 1))
+            echo "--- Iteration $ITERATION ---"
+
+            # superjson encodes an empty object as {"json":{}}
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST "$API_BASE_URL/_api/coverage-zips/csv-process-job" \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: $API_KEY" \
+              -d '{"json":{}}')
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+
+            echo "HTTP $HTTP_CODE"
+            echo "Response: $BODY"
+
+            # Check for HTTP errors
+            if [ "$HTTP_CODE" -ge 500 ]; then
+              echo "::error::Server error ($HTTP_CODE). Will retry on next scheduled run."
+              exit 1
+            fi
+
+            if [ "$HTTP_CODE" -eq 401 ]; then
+              echo "::error::Authentication failed. Check EXTRACTION_API_KEY secret."
+              exit 1
+            fi
+
+            # Parse the superjson response
+            # superjson wraps the payload in {"json":{...},"meta":{...}}
+            # Extract the inner json object
+            MESSAGE=$(echo "$BODY" | python3 -c "
+          import sys, json
+          try:
+              raw = json.load(sys.stdin)
+              # superjson format: {json: {...}, meta: {...}}
+              data = raw.get('json', raw)
+              print(json.dumps(data))
+          except:
+              print('{}')
+          ")
+
+            echo "Parsed: $MESSAGE"
+
+            STATUS=$(echo "$MESSAGE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+            HAS_MORE=$(echo "$MESSAGE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(str(d.get('hasMore','')).lower())" 2>/dev/null || echo "")
+            MSG_TEXT=$(echo "$MESSAGE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null || echo "")
+
+            echo "Status: $STATUS | hasMore: $HAS_MORE | Message: $MSG_TEXT"
+
+            # No job found — all done
+            if echo "$MSG_TEXT" | grep -qi "No job found"; then
+              echo "✅ No pending jobs. Exiting."
+              exit 0
+            fi
+
+            # Job completed (all finalize batches done)
+            if [ "$STATUS" = "completed" ]; then
+              echo "✅ Job completed! Checking for more jobs..."
+              sleep $SLEEP_BETWEEN_CALLS
+              continue
+            fi
+
+            # Job still in finalize with more batches
+            if [ "$STATUS" = "processing_finalize" ] && [ "$HAS_MORE" = "true" ]; then
+              echo "⏳ Finalize in progress, more batches to process..."
+              sleep $SLEEP_BETWEEN_CALLS
+              continue
+            fi
+
+            # Job finished upsert phase, will enter finalize on next call
+            if [ "$STATUS" = "processing_finalize" ] && [ "$HAS_MORE" != "true" ]; then
+              echo "✅ Finalize batch complete. Checking for more jobs..."
+              sleep $SLEEP_BETWEEN_CALLS
+              continue
+            fi
+
+            # Any other status (processing_upsert returned mid-upsert, etc.)
+            echo "⏳ Job in progress ($STATUS), continuing..."
+            sleep $SLEEP_BETWEEN_CALLS
+          done
+
+          echo "::warning::Reached max iterations ($MAX_ITERATIONS). Will continue on next scheduled run."
