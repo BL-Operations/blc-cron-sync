@@ -193,10 +193,10 @@ async function deleteChunk(path) {
 
 async function main() {
   const forcedJobId = process.argv[2];
-  
+  let job;
+
   try {
     // 1. Find Job
-    let job;
     if (forcedJobId) {
       console.log(`Looking for specific job: ${forcedJobId}`);
       [job] = await sql`SELECT * FROM csv_upload_jobs WHERE id = ${forcedJobId}`;
@@ -592,31 +592,36 @@ async function main() {
       console.log("Recalculating stats...");
       const categories = job.affected_categories || [];
       if (categories.length > 0) {
-        await sql`
-          UPDATE single_coverage_zips_raw r
-          SET num_lead_buyers = sub.cnt
-          FROM (
-            SELECT category, zip, COUNT(DISTINCT lead_buyer) as cnt
-            FROM single_coverage_zips_raw
-            WHERE category = ANY(${categories})
-            GROUP BY category, zip
-          ) sub
-          WHERE r.category = sub.category AND r.zip = sub.zip
-            AND r.category = ANY(${categories})
-        `;
+        for (const cat of categories) {
+          console.log(`Recalculating num_lead_buyers for category: ${cat}`);
+          await sql`
+            UPDATE single_coverage_zips_raw r
+            SET num_lead_buyers = sub.cnt
+            FROM (
+              SELECT zip, COUNT(DISTINCT lead_buyer) as cnt
+              FROM single_coverage_zips_raw
+              WHERE category = ${cat}
+              GROUP BY zip
+            ) sub
+            WHERE r.category = ${cat} AND r.zip = sub.zip
+              AND r.num_lead_buyers IS DISTINCT FROM sub.cnt
+          `;
 
-        await sql`
-          UPDATE single_coverage_zips_raw r
-          SET num_lead_buy_campaigns = sub.cnt
-          FROM (
-            SELECT category, zip, COUNT(DISTINCT lead_buy_campaign) as cnt
-            FROM single_coverage_zips_raw
-            WHERE category = ANY(${categories})
-            GROUP BY category, zip
-          ) sub
-          WHERE r.category = sub.category AND r.zip = sub.zip
-            AND r.category = ANY(${categories})
-        `;
+          console.log(`Recalculating num_lead_buy_campaigns for category: ${cat}`);
+          await sql`
+            UPDATE single_coverage_zips_raw r
+            SET num_lead_buy_campaigns = sub.cnt
+            FROM (
+              SELECT zip, COUNT(DISTINCT lead_buy_campaign) as cnt
+              FROM single_coverage_zips_raw
+              WHERE category = ${cat}
+              GROUP BY zip
+            ) sub
+            WHERE r.category = ${cat} AND r.zip = sub.zip
+              AND r.num_lead_buy_campaigns IS DISTINCT FROM sub.cnt
+          `;
+        }
+        console.log(`Recalculation complete for ${categories.length} categories.`);
       }
 
       // 3e. Clear Cache & Refresh View
@@ -655,34 +660,19 @@ async function main() {
     } catch (error) {
     console.error("FATAL ERROR:", error);
     
-    // Attempt to mark job as failed if we can identify which job we were processing
-    try {
-      const jobId = process.argv[2];
-      if (jobId) {
+    // Attempt to mark the actual job as failed
+    const failJobId = job?.id || process.argv[2];
+    if (failJobId) {
+      try {
         await sql`
           UPDATE csv_upload_jobs 
           SET status = 'failed', error_message = ${error.message || 'Unknown error'}, updated_at = NOW()
-          WHERE id = ${jobId} AND status NOT IN ('completed', 'failed')
+          WHERE id = ${failJobId} AND status NOT IN ('completed', 'failed')
         `;
-        console.log(`Marked job ${jobId} as failed.`);
-      } else {
-        // Try to find the job we were working on (the oldest processing one)
-        const [activeJob] = await sql`
-          SELECT id FROM csv_upload_jobs 
-          WHERE status IN ('processing_upsert', 'processing_finalize')
-          ORDER BY updated_at DESC LIMIT 1
-        `;
-        if (activeJob) {
-          await sql`
-            UPDATE csv_upload_jobs 
-            SET status = 'failed', error_message = ${error.message || 'Unknown error'}, updated_at = NOW()
-            WHERE id = ${activeJob.id}
-          `;
-          console.log(`Marked job ${activeJob.id} as failed.`);
-        }
+        console.log(`Marked job ${failJobId} as failed.`);
+      } catch (markError) {
+        console.error("Failed to mark job as failed:", markError);
       }
-    } catch (markError) {
-      console.error("Failed to mark job as failed:", markError);
     }
     
     process.exit(1);
