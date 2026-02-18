@@ -1,0 +1,16 @@
+{
+  "name": "blc-cron-sync-scripts",
+  "version": "1.0.0",
+  "description": "Scripts for background processing of BuyerLink Connect data",
+  "main": "process-csv-jobs.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node process-csv-jobs.mjs"
+  },
+  "dependencies": {
+    "postgres": "^3.4.7"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
