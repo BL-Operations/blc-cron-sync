@@ -396,9 +396,11 @@ async function processCategory(category) {
   try {
     const csvText = await downloadViewData(`vf_Category=${encodeURIComponent(category)}`);
     const rows = parseCSV(csvText);
-    log(`Parsed ${rows.length} rows for category: ${category}`);
+        log(`Parsed ${rows.length} rows for category: ${category}`);
 
-    const validRows = [];
+    // Use a Map to deduplicate by conflict key (lead_buyer, lead_buy_campaign, category, zip)
+    // Tableau data can contain duplicate rows; last occurrence wins.
+    const deduped = new Map();
 
     for (const row of rows) {
       const brandedVal = row['Branded Campaign'];
@@ -410,10 +412,14 @@ async function processCategory(category) {
 
       if (!leadBuyer || !zip) continue;
 
-      validRows.push({
+      const leadBuyCampaign = row['Lead Buy Campaign'] ?? null;
+      const cat = row['Category'] ?? category;
+      const key = `${leadBuyer}\0${leadBuyCampaign}\0${cat}\0${zip}`;
+
+      deduped.set(key, {
         lead_buyer: leadBuyer,
-        lead_buy_campaign: row['Lead Buy Campaign'] ?? null,
-        category: row['Category'] ?? category,
+        lead_buy_campaign: leadBuyCampaign,
+        category: cat,
         zip,
         city: row['City'] ?? null,
         state: row['State'] ?? null,
@@ -427,6 +433,9 @@ async function processCategory(category) {
         updated_at: new Date(),
       });
     }
+
+    const validRows = [...deduped.values()];
+    log(`Deduplicated to ${validRows.length} unique rows (from ${rows.length} parsed).`);
 
     for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
       const batch = validRows.slice(i, i + BATCH_SIZE);
