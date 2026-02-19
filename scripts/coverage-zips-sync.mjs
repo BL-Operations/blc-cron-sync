@@ -2,8 +2,8 @@
  * Single Buyer Coverage Zips Sync Script
  *
  * This script performs a full sync of coverage data:
- * 1. Extracts data from Tableau for all categories
- * 2. Upserts raw data into Postgres
+ * 1. Extracts data from Tableau (full view download)
+ * 2. Groups data by Category and upserts raw data into Postgres
  * 3. Cleans up stale data from previous runs
  * 4. Syncs Campaign Groups to Salesforce
  * 5. Refreshes materialized views and caches
@@ -21,7 +21,7 @@ const SALESFORCE_API_VERSION = 'v59.0';
 const TABLEAU_API_VERSION = '3.22';
 
 const REQUIRED_ENV_VARS = [
-    'SUPABASE_DATABASE_URL',
+  'SUPABASE_DATABASE_URL',
   'TABLEAU_SERVER_URL',
   'TABLEAU_SITE_ID',
   'TABLEAU_PAT_NAME',
@@ -165,7 +165,10 @@ async function authenticateTableau() {
 
 async function downloadViewData(filter) {
   const viewId = process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID;
-  const url = `${process.env.TABLEAU_SERVER_URL}/api/${TABLEAU_API_VERSION}/sites/${tableauSiteId}/views/${viewId}/data?${filter}`;
+  let url = `${process.env.TABLEAU_SERVER_URL}/api/${TABLEAU_API_VERSION}/sites/${tableauSiteId}/views/${viewId}/data`;
+  if (filter) {
+    url += `?${filter}`;
+  }
 
   const response = await fetch(url, {
     method: 'GET',
@@ -177,33 +180,6 @@ async function downloadViewData(filter) {
   }
 
   return response.text();
-}
-
-async function getCategories() {
-  log('Discovering categories...');
-
-  const rows = await sql`
-    SELECT DISTINCT category FROM single_coverage_zips_raw WHERE category IS NOT NULL
-  `;
-
-  let categories = rows.map((r) => r.category);
-
-  if (categories.length === 0) {
-    log('No categories found in DB. Fetching sample from Tableau to discover categories...');
-    const csvText = await downloadViewData('vf_State=CA');
-    const sampleRows = parseCSV(csvText);
-    const discovered = [...new Set(sampleRows.map((r) => r['Category']).filter(Boolean))];
-    if (discovered.length > 0) {
-      categories = discovered;
-      log(`Discovered ${categories.length} categories from Tableau sample.`);
-    } else {
-      log('Could not discover categories from Tableau. Falling back to default list.');
-      categories = ['Home Improvement', 'Solar', 'Insurance', 'Home Services'];
-    }
-  }
-
-  log(`Found ${categories.length} categories to process.`, categories);
-  return categories;
 }
 
 // =============================================================================
@@ -392,29 +368,30 @@ async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
 
 // --- Phase 1: Tableau Extraction ---
 
-async function processCategory(category) {
+async function processCategory(category, rows) {
   try {
-    const csvText = await downloadViewData(`vf_Category=${encodeURIComponent(category)}`);
-    const rows = parseCSV(csvText);
-        log(`Parsed ${rows.length} rows for category: ${category}`);
+    log(`Processing ${rows.length} rows for category: ${category}`);
 
     // Use a Map to deduplicate by conflict key (lead_buyer, lead_buy_campaign, category, zip)
     // Tableau data can contain duplicate rows; last occurrence wins.
     const deduped = new Map();
 
     for (const row of rows) {
-      const brandedVal = row['Branded Campaign'];
-      if (brandedVal === 'All') continue; // skip aggregate rows
-
-      const isBranded = brandedVal === 'Yes';
       const leadBuyer = row['Lead Buyer'];
       const zip = row['Zip'];
 
       if (!leadBuyer || !zip) continue;
 
       const leadBuyCampaign = row['Lead Buy Campaign'] ?? null;
-      const cat = row['Category'] ?? category;
+      // Note: we use the passed 'category' which comes from the grouping key, 
+      // ensuring consistency if the row['Category'] was slightly different or we want to enforce it.
+      // However, the grouping logic guarantees row['Category'] === category.
+      const cat = category;
       const key = `${leadBuyer}\0${leadBuyCampaign}\0${cat}\0${zip}`;
+
+      // Derive is_branded from lead_buy_campaign
+      const lbLower = (leadBuyCampaign || '').toLowerCase();
+      const isBranded = lbLower.includes('microsite') || lbLower.includes('branded');
 
       deduped.set(key, {
         lead_buyer: leadBuyer,
@@ -435,7 +412,7 @@ async function processCategory(category) {
     }
 
     const validRows = [...deduped.values()];
-    log(`Deduplicated to ${validRows.length} unique rows (from ${rows.length} parsed).`);
+    log(`Deduplicated to ${validRows.length} unique rows (from ${rows.length} input).`);
 
     for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
       const batch = validRows.slice(i, i + BATCH_SIZE);
@@ -781,13 +758,34 @@ async function main() {
     await updateSyncState({ phase: 1, state: 'Authenticating with Tableau' });
     await authenticateTableau();
 
-    await updateSyncState({ state: 'Discovering categories' });
-    const categories = await getCategories();
+    // 1. Download full view data
+    await updateSyncState({ state: 'Downloading full Tableau view data...' });
+    log('Downloading full view data from Tableau...');
+    const csvText = await downloadViewData('');
+    const allRows = parseCSV(csvText);
+    log(`Downloaded and parsed ${allRows.length} total rows.`);
 
+    // 2. Group by Category
+    const rowsByCategory = new Map();
+    for (const row of allRows) {
+      const cat = row['Category'];
+      if (!cat) continue;
+
+      if (!rowsByCategory.has(cat)) {
+        rowsByCategory.set(cat, []);
+      }
+      rowsByCategory.get(cat).push(row);
+    }
+
+    const categories = [...rowsByCategory.keys()];
+    log(`Found ${categories.length} categories: ${categories.join(', ')}`);
+
+    // 3. Process each category
     await updateSyncState({ state: `Extracting ${categories.length} categories` });
     for (const cat of categories) {
       log(`Processing category: ${cat}`);
-      await processCategory(cat);
+      const categoryRows = rowsByCategory.get(cat) || [];
+      await processCategory(cat, categoryRows);
     }
 
     // --- Phase 2: Cleanup ---
