@@ -82,42 +82,42 @@ async function updateSyncState(fields) {
     if (fields.phase !== undefined) {
       await sql`
         UPDATE single_coverage_zips_sync_state
-        SET current_phase = ${fields.phase}, updated_at = NOW()
+        SET current_phase = ${fields.phase}, last_updated_at = NOW()
         WHERE id = ${syncStateId}
       `;
     }
     if (fields.state !== undefined) {
       await sql`
         UPDATE single_coverage_zips_sync_state
-        SET current_state = ${fields.state}, updated_at = NOW()
+        SET current_state = ${fields.state}, last_updated_at = NOW()
         WHERE id = ${syncStateId}
       `;
     }
     if (fields.recordsProcessed !== undefined) {
       await sql`
         UPDATE single_coverage_zips_sync_state
-        SET records_processed = records_processed + ${fields.recordsProcessed}, updated_at = NOW()
+        SET records_processed = records_processed + ${fields.recordsProcessed}, last_updated_at = NOW()
         WHERE id = ${syncStateId}
       `;
     }
     if (fields.errorMessage !== undefined) {
       await sql`
         UPDATE single_coverage_zips_sync_state
-        SET error_message = ${fields.errorMessage}, updated_at = NOW()
+        SET error_message = ${fields.errorMessage}, last_updated_at = NOW()
         WHERE id = ${syncStateId}
       `;
     }
     if (fields.completedAt !== undefined) {
       await sql`
         UPDATE single_coverage_zips_sync_state
-        SET completed_at = ${fields.completedAt}, updated_at = NOW()
+        SET completed_at = ${fields.completedAt}, last_updated_at = NOW()
         WHERE id = ${syncStateId}
       `;
     }
     if (fields.status !== undefined) {
       await sql`
         UPDATE single_coverage_zips_sync_state
-        SET status = ${fields.status}, updated_at = NOW()
+        SET status = ${fields.status}, last_updated_at = NOW()
         WHERE id = ${syncStateId}
       `;
     }
@@ -424,7 +424,7 @@ async function processCategory(category) {
         buyer_status: row['Buyer Status'] ?? null,
         campaign_status: row['Campaign Status'] ?? null,
         sync_run_id: syncRunId,
-        updated_at: new Date(),
+        last_updated_at: new Date(),
       });
     }
 
@@ -435,7 +435,7 @@ async function processCategory(category) {
         ON CONFLICT (lead_buyer, lead_buy_campaign, category, zip)
         DO UPDATE SET
           sync_run_id    = EXCLUDED.sync_run_id,
-          updated_at     = NOW(),
+          last_updated_at     = NOW(),
           is_branded     = EXCLUDED.is_branded,
           city           = EXCLUDED.city,
           state          = EXCLUDED.state,
@@ -640,7 +640,7 @@ async function syncSalesforce() {
           ON CONFLICT (salesforce_account_id, product, salesforce_category)
           DO UPDATE SET
             salesforce_campaign_group_id = EXCLUDED.salesforce_campaign_group_id,
-            updated_at = NOW()
+            last_updated_at = NOW()
         `;
       }
 
@@ -750,7 +750,7 @@ async function main() {
 
     const syncRes = await sql`
       INSERT INTO single_coverage_zips_sync_state
-        (sync_run_id, view_id, status, current_phase, current_state, started_at, updated_at, phase_stats)
+        (sync_run_id, view_id, status, current_phase, current_state, started_at, last_updated_at, phase_stats)
       VALUES
         (
           ${syncRunId},
