@@ -684,28 +684,32 @@ async function postProcessing() {
       AND (r.state IS NULL OR r.county IS NULL)
   `;
 
-  // 2. Recalculate density counts across ALL rows in the table
+    // 2. Recalculate density counts per category (done one at a time to avoid deadlocks)
   //    num_lead_buyers   = distinct buyers with campaign_status = 'Active' per category+zip
   //    num_lead_buy_campaigns = distinct campaigns (all statuses) per category+zip
   log('Recalculating density counts...');
-  await sql`
-    WITH stats AS (
-      SELECT
-        category,
-        zip,
-        COUNT(DISTINCT lead_buyer) FILTER (WHERE campaign_status = 'Active') AS buyer_count,
-        COUNT(DISTINCT lead_buy_campaign)                                      AS campaign_count
-      FROM single_coverage_zips_raw
-      GROUP BY category, zip
-    )
-    UPDATE single_coverage_zips_raw t
-    SET
-      num_lead_buyers        = s.buyer_count,
-      num_lead_buy_campaigns = s.campaign_count
-    FROM stats s
-    WHERE t.category = s.category
-      AND t.zip      = s.zip
-  `;
+  const densityCategories = await sql`SELECT DISTINCT category FROM single_coverage_zips_raw`;
+  for (const row of densityCategories) {
+    await sql`
+      WITH stats AS (
+        SELECT
+          zip,
+          COUNT(DISTINCT lead_buyer) FILTER (WHERE campaign_status = 'Active') AS buyer_count,
+          COUNT(DISTINCT lead_buy_campaign)                                      AS campaign_count
+        FROM single_coverage_zips_raw
+        WHERE category = ${row.category}
+        GROUP BY zip
+      )
+      UPDATE single_coverage_zips_raw t
+      SET
+        num_lead_buyers        = s.buyer_count,
+        num_lead_buy_campaigns = s.campaign_count
+      FROM stats s
+      WHERE t.category = ${row.category}
+        AND t.zip      = s.zip
+    `;
+    log(`  density counts done for: ${row.category}`);
+  }
 
   // 3. Clear application cache
   log('Clearing application cache...');
