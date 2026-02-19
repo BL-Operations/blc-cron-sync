@@ -7,16 +7,18 @@
  * 3. Cleans up stale data from previous runs
  * 4. Syncs Campaign Groups to Salesforce
  * 5. Refreshes materialized views and caches
- *
- * IMPORTANT: This is a single self-contained .mjs script for GitHub Actions.
- * It cannot import from other local files.
  */
 
 import postgres from 'postgres';
 
 // =============================================================================
-// Config / Env Vars
+// 1. Configuration & Env Vars
 // =============================================================================
+
+const MAX_RETRIES = 3;
+const BATCH_SIZE = 2000;
+const SALESFORCE_API_VERSION = 'v59.0';
+const TABLEAU_API_VERSION = '3.22';
 
 const REQUIRED_ENV_VARS = [
   'SUPABASE_DATABASE_URL',
@@ -27,59 +29,162 @@ const REQUIRED_ENV_VARS = [
   'TABLEAU_VIEW_COVERAGE_ZIPS_ID',
   'SALESFORCE_OAUTH_CLIENT_ID',
   'SALESFORCE_OAUTH_CLIENT_SECRET',
-  'SALESFORCE_OAUTH_TOKEN_URL',
 ];
 
-function checkEnvVars() {
-  const missing = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
-  if (missing.length > 0) {
-    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
-  }
-  log('All required environment variables are present.');
+const missingVars = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(`Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
 }
 
 // =============================================================================
-// DB Connection
+// 2. DB Connection
 // =============================================================================
 
 const sql = postgres(process.env.SUPABASE_DATABASE_URL, {
   ssl: { rejectUnauthorized: false },
+  max: 10,
+  idle_timeout: 20,
+  connect_timeout: 10,
 });
 
 // =============================================================================
-// Logging
+// Shared State
 // =============================================================================
 
-function log(msg) {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] ${msg}`);
+/** Integer primary key from single_coverage_zips_sync_state */
+let syncStateId = null;
+/** UUID string used as the logical run identifier */
+let syncRunId = null;
+
+// =============================================================================
+// Logging & State Helpers
+// =============================================================================
+
+function log(message, data = null) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`);
+  if (data) console.log(JSON.stringify(data, null, 2));
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Updates specific fields on the sync state row.
+ * Writes explicit SET clauses to avoid dynamic sql() helper issues.
+ *
+ * @param {{ phase?: number, state?: string, recordsProcessed?: number, errorMessage?: string, completedAt?: Date }} fields
+ */
+async function updateSyncState(fields) {
+  if (!syncStateId) return;
+
+  try {
+    if (fields.phase !== undefined) {
+      await sql`
+        UPDATE single_coverage_zips_sync_state
+        SET current_phase = ${fields.phase}, last_updated_at = NOW()
+        WHERE id = ${syncStateId}
+      `;
+    }
+    if (fields.state !== undefined) {
+      await sql`
+        UPDATE single_coverage_zips_sync_state
+        SET current_state = ${fields.state}, last_updated_at = NOW()
+        WHERE id = ${syncStateId}
+      `;
+    }
+    if (fields.recordsProcessed !== undefined) {
+      await sql`
+        UPDATE single_coverage_zips_sync_state
+        SET records_processed = records_processed + ${fields.recordsProcessed}, last_updated_at = NOW()
+        WHERE id = ${syncStateId}
+      `;
+    }
+    if (fields.errorMessage !== undefined) {
+      await sql`
+        UPDATE single_coverage_zips_sync_state
+        SET error_message = ${fields.errorMessage}, last_updated_at = NOW()
+        WHERE id = ${syncStateId}
+      `;
+    }
+    if (fields.completedAt !== undefined) {
+      await sql`
+        UPDATE single_coverage_zips_sync_state
+        SET completed_at = ${fields.completedAt}, last_updated_at = NOW()
+        WHERE id = ${syncStateId}
+      `;
+    }
+    if (fields.status !== undefined) {
+      await sql`
+        UPDATE single_coverage_zips_sync_state
+        SET status = ${fields.status}, last_updated_at = NOW()
+        WHERE id = ${syncStateId}
+      `;
+    }
+  } catch (err) {
+    console.error('Failed to update sync state:', err);
+  }
 }
 
 // =============================================================================
-// CSV Parsing
+// 3. Tableau Auth Helpers
 // =============================================================================
 
-function parseCSV(text) {
-  const lines = text.split('\n');
-  if (lines.length === 0) return [];
+let tableauAuthToken = null;
+let tableauSiteId = null; // actual site ID (UUID) returned from auth
 
-  const headers = parseCSVLine(lines[0]);
-  const rows = [];
+async function authenticateTableau() {
+  log('Authenticating with Tableau...');
+  const url = `${process.env.TABLEAU_SERVER_URL}/api/${TABLEAU_API_VERSION}/auth/signin`;
 
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
+  const body = {
+    credentials: {
+      personalAccessTokenName: process.env.TABLEAU_PAT_NAME,
+      personalAccessTokenSecret: process.env.TABLEAU_PAT_SECRET,
+      site: {
+        contentUrl: process.env.TABLEAU_SITE_ID,
+      },
+    },
+  };
 
-    const values = parseCSVLine(line);
-    const row = {};
-    for (let j = 0; j < headers.length; j++) {
-      row[headers[j]] = values[j] ?? '';
-    }
-    rows.push(row);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Tableau Auth Failed: ${response.status} ${response.statusText}`);
   }
 
-  return rows;
+  const data = await response.json();
+  tableauAuthToken = data.credentials.token;
+  tableauSiteId = data.credentials.site.id;
+  log('Tableau authentication successful.');
 }
+
+async function downloadViewData(filter) {
+  const viewId = process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID;
+  let url = `${process.env.TABLEAU_SERVER_URL}/api/${TABLEAU_API_VERSION}/sites/${tableauSiteId}/views/${viewId}/data`;
+  if (filter) {
+    url += `?${filter}`;
+  }
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'X-Tableau-Auth': tableauAuthToken },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to download Tableau data (filter=${filter}): ${response.statusText}`);
+  }
+
+  return response.text();
+}
+
+// =============================================================================
+// 4. CSV Parsing
+// =============================================================================
 
 function parseCSVLine(line) {
   const result = [];
@@ -88,502 +193,553 @@ function parseCSVLine(line) {
 
   for (let i = 0; i < line.length; i++) {
     const char = line[i];
-
     if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
+      inQuotes = !inQuotes;
     } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
+      result.push(current);
       current = '';
     } else {
       current += char;
     }
   }
+  result.push(current);
+  return result.map((s) => s.trim().replace(/^"|"$/g, '').replace(/""/g, '"'));
+}
 
-  result.push(current.trim());
-  return result;
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = parseCSVLine(lines[0]);
+  const results = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const values = parseCSVLine(line);
+    if (values.length !== headers.length) continue;
+
+    const row = {};
+    headers.forEach((h, idx) => {
+      row[h] = values[idx];
+    });
+    results.push(row);
+  }
+  return results;
 }
 
 // =============================================================================
-// Sync State
+// 5. Salesforce Token Helpers
 // =============================================================================
 
-let syncStateId = null;
-let syncRunId = null;
+let cachedAccessToken = null;
+let cachedInstanceUrl = null;
+let cachedTokenExpiresAt = null;
 
-function setSyncStateId(id) {
-  syncStateId = id;
+function normalizeSfUrl(url) {
+  return url?.replace(/\/$/, '') ?? '';
 }
 
-function setSyncRunId(id) {
-  syncRunId = id;
-}
-
-async function updateSyncState({ phase, state, status, errorMessage, completedAt, phaseStats } = {}) {
-  if (!syncStateId) return;
-
-  const updates = {
-    last_updated_at: new Date(),
-  };
-
-  if (phase !== undefined) updates.current_phase = phase;
-  if (state !== undefined) updates.current_state = state;
-  if (status !== undefined) updates.status = status;
-  if (errorMessage !== undefined) updates.error_message = errorMessage;
-  if (completedAt !== undefined) updates.completed_at = completedAt;
-  if (phaseStats !== undefined) updates.phase_stats = phaseStats;
-
-  try {
-    await sql`
-      UPDATE single_coverage_zips_sync_state
-      SET
-        last_updated_at = ${updates.last_updated_at},
-        current_phase = COALESCE(${updates.current_phase ?? null}, current_phase),
-        current_state = COALESCE(${updates.current_state ?? null}, current_state),
-        status = COALESCE(${updates.status ?? null}, status),
-        error_message = COALESCE(${updates.error_message ?? null}, error_message),
-        completed_at = COALESCE(${updates.completed_at ?? null}, completed_at)
-      WHERE id = ${syncStateId}
-    `;
-  } catch (err) {
-    console.error('Failed to update sync state:', err);
-  }
-}
-
-// =============================================================================
-// Tableau Auth
-// =============================================================================
-
-let tableauToken = null;
-let tableauSiteId = null;
-
-async function authenticateTableau() {
-  const serverUrl = process.env.TABLEAU_SERVER_URL;
-  const patName = process.env.TABLEAU_PAT_NAME;
-  const patSecret = process.env.TABLEAU_PAT_SECRET;
-  const siteContentUrl = process.env.TABLEAU_SITE_ID;
-
-  log(`Authenticating with Tableau at ${serverUrl}...`);
-
-  const response = await fetch(`${serverUrl}/api/3.17/auth/signin`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({
-      credentials: {
-        personalAccessTokenName: patName,
-        personalAccessTokenSecret: patSecret,
-        site: { contentUrl: siteContentUrl },
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Tableau auth failed: ${response.status} ${text}`);
+async function getSalesforceTokens() {
+  if (
+    cachedAccessToken &&
+    cachedInstanceUrl &&
+    cachedTokenExpiresAt &&
+    cachedTokenExpiresAt > Date.now() + 5 * 60 * 1000
+  ) {
+    return { accessToken: cachedAccessToken, instanceUrl: cachedInstanceUrl };
   }
 
-  const data = await response.json();
-  tableauToken = data.credentials.token;
-  tableauSiteId = data.credentials.site.id;
-  log(`Tableau authenticated. Site ID: ${tableauSiteId}`);
-}
-
-async function downloadViewData(filter) {
-  const serverUrl = process.env.TABLEAU_SERVER_URL;
-  const viewId = process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID;
-
-  const url = `${serverUrl}/api/3.17/sites/${tableauSiteId}/views/${viewId}/data?maxAge=0${filter ? `&${filter}` : ''}`;
-
-  log(`Downloading view data from Tableau: ${url}`);
-
-  const response = await fetch(url, {
-    headers: {
-      'X-Tableau-Auth': tableauToken,
-      Accept: 'text/csv',
-    },
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Tableau view download failed: ${response.status} ${text}`);
-  }
-
-  return await response.text();
-}
-
-// =============================================================================
-// Salesforce Auth
-// =============================================================================
-
-let sfAccessToken = null;
-let sfInstanceUrl = null;
-
-async function authenticateSalesforce() {
-  const tokenUrl = process.env.SALESFORCE_OAUTH_TOKEN_URL;
-  const clientId = process.env.SALESFORCE_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.SALESFORCE_OAUTH_CLIENT_SECRET;
-
-  log('Authenticating with Salesforce via OAuth client credentials...');
-
-  const params = new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: clientId,
-    client_secret: clientSecret,
-  });
-
-  const response = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Salesforce auth failed: ${response.status} ${text}`);
-  }
-
-  const data = await response.json();
-  sfAccessToken = data.access_token;
-  sfInstanceUrl = data.instance_url;
-  log(`Salesforce authenticated. Instance: ${sfInstanceUrl}`);
-}
-
-async function salesforceRequest(method, path, body) {
-  if (!sfAccessToken) {
-    await authenticateSalesforce();
-  }
-
-  const url = `${sfInstanceUrl}${path}`;
-  const options = {
-    method,
-    headers: {
-      Authorization: `Bearer ${sfAccessToken}`,
-      'Content-Type': 'application/json',
-    },
-  };
-
-  if (body !== undefined) {
-    options.body = JSON.stringify(body);
-  }
-
-  const response = await fetch(url, options);
-
-  if (response.status === 401) {
-    log('Salesforce token expired, re-authenticating...');
-    sfAccessToken = null;
-    await authenticateSalesforce();
-    return salesforceRequest(method, path, body);
-  }
-
-  return response;
-}
-
-// =============================================================================
-// Phase: Process Category
-// =============================================================================
-
-async function processCategory(category, rows) {
-  log(`Processing category "${category}" with ${rows.length} rows...`);
-
-  if (rows.length === 0) {
-    log(`No rows for category "${category}", skipping.`);
-    return;
-  }
-
-  const upsertRows = rows.map((row) => ({
-    category,
-    lead_buyer: row['Lead Buyer'] ?? '',
-    lead_buy_campaign: row['Lead Buy Campaign'] ?? '',
-    zip: row['Zip'] ?? '',
-    state: row['State'] ?? '',
-    city: row['City'] ?? '',
-    campaign_status: row['Campaign Status'] ?? '',
-    is_branded: (row['Branded'] ?? '').toLowerCase() === 'yes',
-    sync_run_id: syncRunId,
-  }));
-
-  // Batch upsert
-  const BATCH_SIZE = 500;
-  let upserted = 0;
-
-  for (let i = 0; i < upsertRows.length; i += BATCH_SIZE) {
-    const batch = upsertRows.slice(i, i + BATCH_SIZE);
-
-    await sql`
-      INSERT INTO single_coverage_zips_raw
-        (category, lead_buyer, lead_buy_campaign, zip, state, city, campaign_status, is_branded, sync_run_id, last_seen_at)
-      SELECT
-        r.category,
-        r.lead_buyer,
-        r.lead_buy_campaign,
-        r.zip,
-        r.state,
-        r.city,
-        r.campaign_status,
-        r.is_branded,
-        r.sync_run_id,
-        NOW()
-      FROM ${sql.json(batch)} AS r(category, lead_buyer, lead_buy_campaign, zip, state, city, campaign_status, is_branded, sync_run_id)
-      ON CONFLICT (category, lead_buyer, lead_buy_campaign, zip)
-      DO UPDATE SET
-        state = EXCLUDED.state,
-        city = EXCLUDED.city,
-        campaign_status = EXCLUDED.campaign_status,
-        is_branded = EXCLUDED.is_branded,
-        sync_run_id = EXCLUDED.sync_run_id,
-        last_seen_at = NOW()
-    `;
-
-    upserted += batch.length;
-    log(`  Upserted ${upserted}/${upsertRows.length} rows for "${category}"`);
-  }
-
-  log(`Category "${category}" processing complete.`);
-}
-
-// =============================================================================
-// Phase: Cleanup Stale Data
-// =============================================================================
-
-async function cleanupStaleData() {
-  log('Cleaning up stale data from previous runs...');
-
-  const result = await sql`
-    DELETE FROM single_coverage_zips_raw
-    WHERE sync_run_id != ${syncRunId}
-    RETURNING id
+  const rows = await sql`
+    SELECT * FROM salesforce_oauth_tokens ORDER BY created_at DESC LIMIT 1
   `;
 
-  log(`Deleted ${result.length} stale rows.`);
+  if (rows.length === 0) {
+    throw new Error('No Salesforce tokens found in DB.');
+  }
+
+  const tokenData = rows[0];
+  const expiresAt = new Date(tokenData.expires_at).getTime();
+
+  if (Date.now() > expiresAt - 5 * 60 * 1000) {
+    log('Salesforce token expired or near expiry, refreshing...');
+    return refreshSalesforceToken(tokenData);
+  }
+
+  cachedAccessToken = tokenData.access_token;
+  cachedInstanceUrl = normalizeSfUrl(tokenData.instance_url);
+  cachedTokenExpiresAt = expiresAt;
+
+  return { accessToken: cachedAccessToken, instanceUrl: cachedInstanceUrl };
+}
+
+async function refreshSalesforceToken(oldTokenData) {
+  const params = new URLSearchParams();
+  params.append('grant_type', 'refresh_token');
+  params.append('client_id', process.env.SALESFORCE_OAUTH_CLIENT_ID);
+  params.append('client_secret', process.env.SALESFORCE_OAUTH_CLIENT_SECRET);
+  params.append('refresh_token', oldTokenData.refresh_token);
+
+  const tokenUrl =
+    process.env.SALESFORCE_OAUTH_TOKEN_URL ||
+    'https://login.salesforce.com/services/oauth2/token';
+
+  const response = await fetch(normalizeSfUrl(tokenUrl) + (tokenUrl.includes('/token') ? '' : '/services/oauth2/token'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  });
+
+  if (!response.ok) {
+    const txt = await response.text();
+    throw new Error(`SF Token Refresh Failed: ${txt}`);
+  }
+
+  const data = await response.json();
+  const newAccessToken = data.access_token;
+  const newInstanceUrl = normalizeSfUrl(data.instance_url);
+  const newRefreshToken = data.refresh_token || oldTokenData.refresh_token;
+  const newExpiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000);
+
+  // Single-row pattern: delete all then insert
+  await sql`DELETE FROM salesforce_oauth_tokens`;
+  await sql`
+    INSERT INTO salesforce_oauth_tokens
+      (access_token, refresh_token, instance_url, expires_at, token_type)
+    VALUES
+      (${newAccessToken}, ${newRefreshToken}, ${newInstanceUrl}, ${newExpiresAt}, 'Bearer')
+  `;
+
+  cachedAccessToken = newAccessToken;
+  cachedInstanceUrl = newInstanceUrl;
+  cachedTokenExpiresAt = newExpiresAt.getTime();
+
+  log('Salesforce token refreshed and stored.');
+  return { accessToken: cachedAccessToken, instanceUrl: cachedInstanceUrl };
 }
 
 // =============================================================================
-// Phase: Salesforce Sync
+// 6. Salesforce Request Helper
 // =============================================================================
+
+/**
+ * Makes an authenticated request to Salesforce.
+ *
+ * @param {string} endpoint - Full path starting with /services/data/...
+ * @param {{ method?: string, body?: unknown, headers?: Record<string, string> }} options
+ * @param {number} retryCount
+ * @returns {Promise<Response>} Raw fetch Response (caller decides how to read body)
+ */
+async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
+  const { accessToken, instanceUrl } = await getSalesforceTokens();
+  const url = `${instanceUrl}${endpoint}`;
+
+  const fetchOptions = {
+    method: options.method ?? 'GET',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  };
+
+  if (options.body !== undefined) {
+    fetchOptions.body =
+      typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
+  }
+
+  const res = await fetch(url, fetchOptions);
+
+  if (res.status === 401 && retryCount < 1) {
+    log('SF 401 Unauthorized, clearing token cache and retrying...');
+    cachedAccessToken = null;
+    cachedInstanceUrl = null;
+    cachedTokenExpiresAt = null;
+    return salesforceRequest(endpoint, options, retryCount + 1);
+  }
+
+  return res;
+}
+
+// =============================================================================
+// 7. Phase Functions
+// =============================================================================
+
+// --- Phase 1: Tableau Extraction ---
+
+async function processCategory(category, rows) {
+  try {
+    log(`Processing ${rows.length} rows for category: ${category}`);
+
+    // Use a Map to deduplicate by conflict key (lead_buyer, lead_buy_campaign, category, zip)
+    // Tableau data can contain duplicate rows; last occurrence wins.
+    const deduped = new Map();
+
+    for (const row of rows) {
+      const leadBuyer = row['Lead Buyer'];
+      const zip = row['Zip'];
+
+      if (!leadBuyer || !zip) continue;
+
+      const leadBuyCampaign = row['Lead Buy Campaign'] ?? null;
+      // Note: we use the passed 'category' which comes from the grouping key, 
+      // ensuring consistency if the row['Category'] was slightly different or we want to enforce it.
+      // However, the grouping logic guarantees row['Category'] === category.
+      const cat = category;
+      const key = `${leadBuyer}\0${leadBuyCampaign}\0${cat}\0${zip}`;
+
+      // Derive is_branded from lead_buy_campaign
+      const lbLower = (leadBuyCampaign || '').toLowerCase();
+      const isBranded = lbLower.includes('microsite') || lbLower.includes('branded');
+
+      deduped.set(key, {
+        lead_buyer: leadBuyer,
+        lead_buy_campaign: leadBuyCampaign,
+        category: cat,
+        zip,
+        city: row['City'] ?? null,
+        state: row['State'] ?? null,
+        county: row['County'] ?? null,
+        dma: row['DMA'] ?? null,
+        country: row['Country'] ?? 'US',
+        is_branded: isBranded,
+        buyer_status: row['Buyer Status'] ?? null,
+        campaign_status: row['Campaign Status'] ?? null,
+        sync_run_id: syncRunId,
+        updated_at: new Date(),
+      });
+    }
+
+    const validRows = [...deduped.values()];
+    log(`Deduplicated to ${validRows.length} unique rows (from ${rows.length} input).`);
+
+    for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
+      const batch = validRows.slice(i, i + BATCH_SIZE);
+      await sql`
+        INSERT INTO single_coverage_zips_raw ${sql(batch)}
+        ON CONFLICT (lead_buyer, lead_buy_campaign, category, zip)
+        DO UPDATE SET
+          sync_run_id    = EXCLUDED.sync_run_id,
+          updated_at     = NOW(),
+          is_branded     = EXCLUDED.is_branded,
+          city           = EXCLUDED.city,
+          state          = EXCLUDED.state,
+          county         = EXCLUDED.county,
+          dma            = EXCLUDED.dma,
+          buyer_status   = EXCLUDED.buyer_status,
+          campaign_status = EXCLUDED.campaign_status
+      `;
+    }
+
+    log(`Upserted ${validRows.length} rows for category: ${category}`);
+    await updateSyncState({ recordsProcessed: validRows.length });
+  } catch (err) {
+    log(`Error processing category "${category}": ${err instanceof Error ? err.message : String(err)}`);
+    // Non-fatal — continue with remaining categories
+  }
+}
+
+// --- Phase 2: Stale Data Cleanup ---
+
+async function cleanupStaleData() {
+  log('Cleaning up stale data...');
+  const result = await sql`
+    DELETE FROM single_coverage_zips_raw
+    WHERE sync_run_id != ${syncRunId} OR sync_run_id IS NULL
+  `;
+  log(`Deleted ${result.count} stale rows.`);
+}
+
+// --- Phase 3: Salesforce Sync ---
+
+async function uploadCoverageZipsCsv(sfGroupId, category, product, zipsData) {
+  const { accessToken, instanceUrl } = await getSalesforceTokens();
+
+  const sanitizedCategory = category.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+  const sanitizedProduct = product.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+
+  const csvHeader = 'zip,city,state,county,dma,campaign_status,lead_buy_campaign';
+  const csvRows = zipsData.map((z) =>
+    [
+      z.zip ?? '',
+      z.city ?? '',
+      z.state ?? '',
+      z.county ?? '',
+      z.dma ?? '',
+      z.campaign_status ?? '',
+      z.lead_buy_campaign ?? '',
+    ]
+      .map((v) => `"${String(v).replace(/"/g, '""')}"`)
+      .join(',')
+  );
+  const csvContent = [csvHeader, ...csvRows].join('\n');
+
+  const boundary = `----FlootBoundary${Math.random().toString(36).substr(2, 16)}`;
+
+  const metadata = {
+    Title: `Coverage Zips - ${category}`,
+    PathOnClient: `coverage_zips_${sanitizedCategory}_${sanitizedProduct}.csv`,
+    FirstPublishLocationId: sfGroupId,
+  };
+
+  let body = '';
+  body += `--${boundary}\r\n`;
+  body += 'Content-Disposition: form-data; name="entity_content";\r\n';
+  body += 'Content-Type: application/json\r\n\r\n';
+  body += JSON.stringify(metadata) + '\r\n';
+  body += `--${boundary}\r\n`;
+  body += `Content-Disposition: form-data; name="VersionData"; filename="${metadata.PathOnClient}"\r\n`;
+  body += 'Content-Type: text/csv\r\n\r\n';
+  body += csvContent + '\r\n';
+  body += `--${boundary}--`;
+
+  const url = `${instanceUrl}/services/data/${SALESFORCE_API_VERSION}/sobjects/ContentVersion`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const txt = await response.text();
+    throw new Error(`Failed to upload ContentVersion for "${category}": ${txt}`);
+  }
+
+  return response.json();
+}
 
 async function syncSalesforce() {
   log('Starting Salesforce Campaign Group Sync...');
 
-  // Load active category mappings from DB
-  const mappingRows = await sql`
-    SELECT tableau_category, salesforce_category
-    FROM category_mappings
-    WHERE is_active = true AND salesforce_category IS NOT NULL
-  `;
-  const categoryMap = new Map();
-  for (const row of mappingRows) {
-    categoryMap.set(row.tableau_category, row.salesforce_category);
-  }
-  log(`Loaded ${categoryMap.size} active category mappings.`);
-
-  await authenticateSalesforce();
-
-  // Get distinct combos of lead_buyer + category + is_branded with active zip counts
+  // After cleanup, all rows in the table belong to the current run.
+  // Count active zips only (campaign_status = 'Active').
   const combos = await sql`
     SELECT
       lead_buyer,
       category,
       is_branded,
-      COUNT(DISTINCT zip) FILTER (WHERE campaign_status = 'Active') AS active_zip_count
+      COUNT(*) FILTER (WHERE campaign_status = 'Active') AS active_zip_count
     FROM single_coverage_zips_raw
     GROUP BY lead_buyer, category, is_branded
-    ORDER BY lead_buyer, category, is_branded
   `;
 
-  log(`Found ${combos.length} lead_buyer/category/is_branded combos to sync.`);
-
-  let created = 0;
-  let updated = 0;
-  let skipped = 0;
-  let errors = 0;
+  log(`Found ${combos.length} unique buyer/category/branded combinations to sync.`);
 
   for (const combo of combos) {
-    const { lead_buyer, category, is_branded, active_zip_count } = combo;
-
-    // Resolve mapped Salesforce category
-    const sfCategory = categoryMap.get(category) || null;
-    if (!sfCategory) {
-      log(`Skipping "${lead_buyer}" / "${category}": No Salesforce category mapping found.`);
-      skipped++;
-      continue;
-    }
-
     try {
-      const derivedProduct = is_branded ? 'Branded' : 'Non-Branded';
-      const campaignGroupName = `${derivedProduct} | ${sfCategory}`;
+      const { lead_buyer, category, is_branded, active_zip_count } = combo;
 
-      // Check tracking table (uses raw `category` as the key — Tableau category)
-      const existing = await sql`
-        SELECT id, sf_campaign_group_id, last_synced_at
-        FROM campaign_groups_sync_tracking
-        WHERE lead_buyer = ${lead_buyer}
-          AND category = ${category}
-          AND is_branded = ${is_branded}
+      const derivedProduct = is_branded
+        ? 'Marketplace - Branded'
+        : 'Marketplace - Standard - HS';
+
+      // Strip trailing " (123)" buyer ID suffix
+      const cleanBuyerName = lead_buyer.replace(/\s*\([^)]*\)\s*$/, '').trim();
+
+      // Resolve Salesforce Account ID
+      const accountLink = await sql`
+        SELECT sa.salesforce_id
+        FROM unified_accounts ua
+        JOIN salesforce_accounts sa ON ua.linked_account_id = sa.id
+        WHERE ua.tableau_account_name = ${cleanBuyerName}
         LIMIT 1
       `;
 
-      let sfCampaignGroupId = existing.length > 0 ? existing[0].sf_campaign_group_id : null;
+      if (accountLink.length === 0) {
+        log(`Skipping "${cleanBuyerName}": No linked Salesforce Account found.`);
+        continue;
+      }
+      const sfAccountId = accountLink[0].salesforce_id;
 
-      if (sfCampaignGroupId) {
-        // Update existing Campaign Group in Salesforce
-        const patchRes = await salesforceRequest(
-          'PATCH',
-          `/services/data/v57.0/sobjects/Campaign_Group__c/${sfCampaignGroupId}`,
-          {
-            Name: campaignGroupName,
-            Category_New__c: sfCategory,
-            Active_Zip_Count__c: Number(active_zip_count),
-            Is_Branded__c: is_branded,
-          }
-        );
+      const campaignGroupName = `${derivedProduct} | ${category}`;
 
-        if (!patchRes.ok && patchRes.status !== 204) {
-          const text = await patchRes.text();
-          throw new Error(`SF PATCH failed: ${patchRes.status} ${text}`);
-        }
+      // Check local tracking table first
+      const tracking = await sql`
+        SELECT salesforce_campaign_group_id
+        FROM campaign_groups_sync_tracking
+        WHERE salesforce_account_id = ${sfAccountId}
+          AND product = ${derivedProduct}
+          AND salesforce_category = ${category}
+        LIMIT 1
+      `;
 
-        // Update tracking table (uses raw `category`)
-        await sql`
-          UPDATE campaign_groups_sync_tracking
-          SET
-            last_synced_at = NOW(),
-            active_zip_count = ${Number(active_zip_count)},
-            campaign_group_name = ${campaignGroupName}
-          WHERE lead_buyer = ${lead_buyer}
-            AND category = ${category}
-            AND is_branded = ${is_branded}
-        `;
+      let sfCampaignGroupId = null;
 
-        updated++;
+      if (tracking.length > 0) {
+        sfCampaignGroupId = tracking[0].salesforce_campaign_group_id;
+        log(`Found existing Campaign Group (tracking): ${sfCampaignGroupId}`);
       } else {
-        // Create new Campaign Group in Salesforce
-        const postRes = await salesforceRequest(
-          'POST',
-          '/services/data/v57.0/sobjects/Campaign_Group__c',
-          {
-            Name: campaignGroupName,
-            Category_New__c: sfCategory,
-            Active_Zip_Count__c: Number(active_zip_count),
-            Is_Branded__c: is_branded,
-            Lead_Buyer__c: lead_buyer,
-          }
+        // Query Salesforce
+        const soql = `SELECT Id FROM Campaign_Group__c WHERE Name = '${campaignGroupName.replace(/'/g, "\\'")}' AND Account__c = '${sfAccountId}' LIMIT 1`;
+        const queryRes = await salesforceRequest(
+          `/services/data/${SALESFORCE_API_VERSION}/query?q=${encodeURIComponent(soql)}`
         );
 
-        if (!postRes.ok) {
-          const text = await postRes.text();
-          throw new Error(`SF POST failed: ${postRes.status} ${text}`);
+        if (!queryRes.ok) {
+          const txt = await queryRes.text();
+          throw new Error(`SF SOQL query failed: ${txt}`);
         }
 
-        const postData = await postRes.json();
-        sfCampaignGroupId = postData.id;
+        const queryData = await queryRes.json();
 
-        // Insert into tracking table (uses raw `category`)
+        if (queryData.totalSize > 0) {
+          sfCampaignGroupId = queryData.records[0].Id;
+          log(`Found existing Campaign Group (SF query): ${sfCampaignGroupId}`);
+        } else {
+          log(`Creating new Campaign Group: "${campaignGroupName}" for Account ${sfAccountId}`);
+          const createRes = await salesforceRequest(
+            `/services/data/${SALESFORCE_API_VERSION}/sobjects/Campaign_Group__c`,
+            {
+              method: 'POST',
+              body: {
+                Name: campaignGroupName,
+                Account__c: sfAccountId,
+                Product_c__c: derivedProduct,
+                Category_New__c: category,
+                Buyerlink_Vertical__c: 'Home Services',
+                Status__c: 'Active',
+              },
+            }
+          );
+
+          if (!createRes.ok) {
+            const txt = await createRes.text();
+            throw new Error(`SF Campaign Group creation failed: ${txt}`);
+          }
+
+          const createData = await createRes.json();
+          sfCampaignGroupId = createData.id;
+          log(`Created Campaign Group: ${sfCampaignGroupId}`);
+        }
+
+        // Upsert into local tracking table
         await sql`
           INSERT INTO campaign_groups_sync_tracking
-            (lead_buyer, category, is_branded, sf_campaign_group_id, campaign_group_name, active_zip_count, last_synced_at)
+            (salesforce_account_id, product, salesforce_category, salesforce_campaign_group_id, status)
           VALUES
-            (${lead_buyer}, ${category}, ${is_branded}, ${sfCampaignGroupId}, ${campaignGroupName}, ${Number(active_zip_count)}, NOW())
-          ON CONFLICT (lead_buyer, category, is_branded)
+            (${sfAccountId}, ${derivedProduct}, ${category}, ${sfCampaignGroupId}, 'active')
+          ON CONFLICT (salesforce_account_id, product, salesforce_category)
           DO UPDATE SET
-            sf_campaign_group_id = EXCLUDED.sf_campaign_group_id,
-            campaign_group_name = EXCLUDED.campaign_group_name,
-            active_zip_count = EXCLUDED.active_zip_count,
-            last_synced_at = NOW()
+            salesforce_campaign_group_id = EXCLUDED.salesforce_campaign_group_id,
+            updated_at = NOW()
         `;
-
-        created++;
       }
+
+      // PATCH active zip count
+      const patchRes = await salesforceRequest(
+        `/services/data/${SALESFORCE_API_VERSION}/sobjects/Campaign_Group__c/${sfCampaignGroupId}`,
+        {
+          method: 'PATCH',
+          body: { Active_Zip_Code_Count__c: parseInt(active_zip_count, 10) },
+        }
+      );
+
+      if (patchRes.status !== 204 && !patchRes.ok) {
+        const txt = await patchRes.text();
+        throw new Error(`SF PATCH zip count failed: ${txt}`);
+      }
+
+      // Fetch all zip data for this combo and upload CSV
+      const zipsData = await sql`
+        SELECT zip, city, state, county, dma, campaign_status, lead_buy_campaign
+        FROM single_coverage_zips_raw
+        WHERE lead_buyer = ${lead_buyer}
+          AND category = ${category}
+          AND is_branded = ${is_branded}
+      `;
+
+      await uploadCoverageZipsCsv(sfCampaignGroupId, category, derivedProduct, zipsData);
+
+      log(
+        `Synced "${cleanBuyerName}" — "${campaignGroupName}": active_zip_count=${active_zip_count}, csv_rows=${zipsData.length}`
+      );
     } catch (err) {
-      errors++;
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`Error syncing "${lead_buyer}" / "${category}" / branded=${is_branded}: ${message}`);
+      log(
+        `Error syncing combo ${JSON.stringify(combo)}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      // Non-fatal — continue with remaining combos
     }
   }
-
-  log(`Salesforce sync complete. Created: ${created}, Updated: ${updated}, Skipped: ${skipped}, Errors: ${errors}`);
 }
 
-// =============================================================================
-// Phase: Post-Processing
-// =============================================================================
+// --- Phase 4: Post-Processing ---
 
 async function postProcessing() {
   log('Starting post-processing...');
 
-  // 1. Location enrichment — fill in missing state/city from known zips
-  log('Enriching missing location data...');
+  // 1. Location enrichment for rows missing state or county
+  log('Enriching locations from zip_code_lookup...');
   await sql`
+    UPDATE single_coverage_zips_raw r
+    SET
+      state  = z.state,
+      county = z.county
+    FROM zip_code_lookup z
+    WHERE r.zip = z.zip
+      AND (r.state IS NULL OR r.county IS NULL)
+  `;
+
+  // 2. Recalculate density counts across ALL rows in the table
+  //    num_lead_buyers   = distinct buyers with campaign_status = 'Active' per category+zip
+  //    num_lead_buy_campaigns = distinct campaigns (all statuses) per category+zip
+  log('Recalculating density counts...');
+  await sql`
+    WITH stats AS (
+      SELECT
+        category,
+        zip,
+        COUNT(DISTINCT lead_buyer) FILTER (WHERE campaign_status = 'Active') AS buyer_count,
+        COUNT(DISTINCT lead_buy_campaign)                                      AS campaign_count
+      FROM single_coverage_zips_raw
+      GROUP BY category, zip
+    )
     UPDATE single_coverage_zips_raw t
     SET
-      state = s.state,
-      city = s.city
-    FROM (
-      SELECT DISTINCT ON (zip) zip, state, city
-      FROM single_coverage_zips_raw
-      WHERE state != '' AND city != ''
-      ORDER BY zip, last_seen_at DESC
-    ) s
-    WHERE t.zip = s.zip
-      AND (t.state = '' OR t.city = '')
+      num_lead_buyers        = s.buyer_count,
+      num_lead_buy_campaigns = s.campaign_count
+    FROM stats s
+    WHERE t.category = s.category
+      AND t.zip      = s.zip
   `;
-  log('Location enrichment complete.');
 
-  // 2. Recalculate density counts per-category to avoid deadlocks
-  log('Recalculating density counts...');
-  const densityCategories = await sql`SELECT DISTINCT category FROM single_coverage_zips_raw`;
-  for (const { category } of densityCategories) {
-    await sql`
-      WITH stats AS (
-        SELECT
-          zip,
-          COUNT(DISTINCT lead_buyer) FILTER (WHERE campaign_status = 'Active') AS buyer_count,
-          COUNT(DISTINCT lead_buy_campaign) AS campaign_count
-        FROM single_coverage_zips_raw
-        WHERE category = ${category}
-        GROUP BY zip
-      )
-      UPDATE single_coverage_zips_raw t
-      SET
-        num_lead_buyers = s.buyer_count,
-        num_lead_buy_campaigns = s.campaign_count
-      FROM stats s
-      WHERE t.category = ${category}
-        AND t.zip = s.zip
-    `;
+  // 3. Clear application cache
+  log('Clearing application cache...');
+  await sql`TRUNCATE TABLE cache_entries`;
+
+  // 4. Refresh materialized view
+  log('Refreshing materialized view...');
+  try {
+    await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY single_buyer_coverage_summary`;
+  } catch (err) {
+    log('Concurrent refresh failed (view likely not yet populated), trying standard refresh...');
+    await sql`REFRESH MATERIALIZED VIEW single_buyer_coverage_summary`;
   }
-  log(`Density counts recalculated for ${densityCategories.length} categories.`);
-
-  // 3. Refresh materialized views
-  log('Refreshing materialized views...');
-  await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY coverage_zips_summary`;
-  log('Materialized views refreshed.');
 
   log('Post-processing complete.');
 }
 
 // =============================================================================
-// Main Function
+// 8. Main Function
 // =============================================================================
 
 async function main() {
-  checkEnvVars();
   const start = Date.now();
 
   try {
     // Generate run ID without crypto.randomUUID()
-    const runId = `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    setSyncRunId(runId);
+    syncRunId = `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     const syncRes = await sql`
       INSERT INTO single_coverage_zips_sync_state
         (sync_run_id, view_id, status, current_phase, current_state, started_at, last_updated_at, phase_stats)
       VALUES
         (
-          ${runId},
+          ${syncRunId},
           ${process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID ?? 'unknown'},
           'extracting',
           1,
@@ -595,8 +751,8 @@ async function main() {
       RETURNING id
     `;
 
-    setSyncStateId(syncRes[0].id);
-    log(`Started Sync Run: ${runId} (state row id=${syncRes[0].id})`);
+    syncStateId = syncRes[0].id;
+    log(`Started Sync Run: ${syncRunId} (state row id=${syncStateId})`);
 
     // --- Phase 1: Extraction ---
     await updateSyncState({ phase: 1, state: 'Authenticating with Tableau' });
