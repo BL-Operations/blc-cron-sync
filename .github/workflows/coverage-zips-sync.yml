@@ -2,7 +2,7 @@ name: Coverage Zips Sync (Tableau Extract + Salesforce)
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -27,12 +27,12 @@ jobs:
 
       - name: Run Sync Script
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
           TABLEAU_SERVER_URL: ${{ secrets.TABLEAU_SERVER_URL }}
           TABLEAU_SITE_ID: ${{ secrets.TABLEAU_SITE_ID }}
           TABLEAU_PAT_NAME: ${{ secrets.TABLEAU_PAT_NAME }}
           TABLEAU_PAT_SECRET: ${{ secrets.TABLEAU_PAT_SECRET }}
-          TABLEAU_VIEW_ID: ${{ secrets.TABLEAU_VIEW_ID }}
+          TABLEAU_VIEW_COVERAGE_ZIPS_ID: ${{ secrets.TABLEAU_VIEW_COVERAGE_ZIPS_ID }}
           SALESFORCE_OAUTH_CLIENT_ID: ${{ secrets.SALESFORCE_OAUTH_CLIENT_ID }}
           SALESFORCE_OAUTH_CLIENT_SECRET: ${{ secrets.SALESFORCE_OAUTH_CLIENT_SECRET }}
           SALESFORCE_OAUTH_TOKEN_URL: ${{ secrets.SALESFORCE_OAUTH_TOKEN_URL }}
