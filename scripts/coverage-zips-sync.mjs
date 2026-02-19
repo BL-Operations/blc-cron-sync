@@ -21,12 +21,12 @@ const SALESFORCE_API_VERSION = 'v59.0';
 const TABLEAU_API_VERSION = '3.22';
 
 const REQUIRED_ENV_VARS = [
-  'DATABASE_URL',
+    'SUPABASE_DATABASE_URL',
   'TABLEAU_SERVER_URL',
   'TABLEAU_SITE_ID',
   'TABLEAU_PAT_NAME',
   'TABLEAU_PAT_SECRET',
-  'TABLEAU_VIEW_ID',
+  'TABLEAU_VIEW_COVERAGE_ZIPS_ID',
   'SALESFORCE_OAUTH_CLIENT_ID',
   'SALESFORCE_OAUTH_CLIENT_SECRET',
 ];
@@ -41,7 +41,7 @@ if (missingVars.length > 0) {
 // 2. DB Connection
 // =============================================================================
 
-const sql = postgres(process.env.DATABASE_URL, {
+const sql = postgres(process.env.SUPABASE_DATABASE_URL, {
   ssl: { rejectUnauthorized: false },
   max: 10,
   idle_timeout: 20,
@@ -164,7 +164,7 @@ async function authenticateTableau() {
 }
 
 async function downloadViewData(filter) {
-  const viewId = process.env.TABLEAU_VIEW_ID;
+  const viewId = process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID;
   const url = `${process.env.TABLEAU_SERVER_URL}/api/${TABLEAU_API_VERSION}/sites/${tableauSiteId}/views/${viewId}/data?${filter}`;
 
   const response = await fetch(url, {
@@ -754,7 +754,7 @@ async function main() {
       VALUES
         (
           ${syncRunId},
-          ${process.env.TABLEAU_VIEW_ID ?? 'unknown'},
+          ${process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID ?? 'unknown'},
           'running',
           1,
           'Starting',
