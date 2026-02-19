@@ -1,0 +1,39 @@
+name: Coverage Zips Sync (Tableau Extract + Salesforce)
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-zips-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install postgres
+
+      - name: Run Sync Script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TABLEAU_SERVER_URL: ${{ secrets.TABLEAU_SERVER_URL }}
+          TABLEAU_SITE_ID: ${{ secrets.TABLEAU_SITE_ID }}
+          TABLEAU_PAT_NAME: ${{ secrets.TABLEAU_PAT_NAME }}
+          TABLEAU_PAT_SECRET: ${{ secrets.TABLEAU_PAT_SECRET }}
+          TABLEAU_VIEW_ID: ${{ secrets.TABLEAU_VIEW_ID }}
+          SALESFORCE_OAUTH_CLIENT_ID: ${{ secrets.SALESFORCE_OAUTH_CLIENT_ID }}
+          SALESFORCE_OAUTH_CLIENT_SECRET: ${{ secrets.SALESFORCE_OAUTH_CLIENT_SECRET }}
+          SALESFORCE_OAUTH_TOKEN_URL: ${{ secrets.SALESFORCE_OAUTH_TOKEN_URL }}
+        run: node scripts/coverage-zips-sync.mjs
