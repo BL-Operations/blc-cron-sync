@@ -755,7 +755,7 @@ async function main() {
         (
           ${syncRunId},
           ${process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID ?? 'unknown'},
-          'running',
+          'extracting',
           1,
           'Starting',
           NOW(),
