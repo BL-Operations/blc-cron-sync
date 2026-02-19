@@ -424,7 +424,7 @@ async function processCategory(category) {
         buyer_status: row['Buyer Status'] ?? null,
         campaign_status: row['Campaign Status'] ?? null,
         sync_run_id: syncRunId,
-        last_updated_at: new Date(),
+        updated_at: new Date(),
       });
     }
 
@@ -435,7 +435,7 @@ async function processCategory(category) {
         ON CONFLICT (lead_buyer, lead_buy_campaign, category, zip)
         DO UPDATE SET
           sync_run_id    = EXCLUDED.sync_run_id,
-          last_updated_at     = NOW(),
+          updated_at     = NOW(),
           is_branded     = EXCLUDED.is_branded,
           city           = EXCLUDED.city,
           state          = EXCLUDED.state,
@@ -640,7 +640,7 @@ async function syncSalesforce() {
           ON CONFLICT (salesforce_account_id, product, salesforce_category)
           DO UPDATE SET
             salesforce_campaign_group_id = EXCLUDED.salesforce_campaign_group_id,
-            last_updated_at = NOW()
+            updated_at = NOW()
         `;
       }
 
