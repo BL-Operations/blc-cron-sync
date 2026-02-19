@@ -19,19 +19,15 @@ import postgres from 'postgres';
 // =============================================================================
 
 const REQUIRED_ENV_VARS = [
-  'DATABASE_URL',
+  'SUPABASE_DATABASE_URL',
   'TABLEAU_SERVER_URL',
+  'TABLEAU_SITE_ID',
   'TABLEAU_PAT_NAME',
   'TABLEAU_PAT_SECRET',
-  'TABLEAU_SITE_ID',
   'TABLEAU_VIEW_COVERAGE_ZIPS_ID',
-  'SALESFORCE_CLIENT_ID',
-  'SALESFORCE_CLIENT_SECRET',
-  'SALESFORCE_USERNAME',
-  'SALESFORCE_PASSWORD',
-  'SALESFORCE_SECURITY_TOKEN',
-  'SALESFORCE_LOGIN_URL',
-  'BLC_APP_URL',
+  'SALESFORCE_OAUTH_CLIENT_ID',
+  'SALESFORCE_OAUTH_CLIENT_SECRET',
+  'SALESFORCE_OAUTH_TOKEN_URL',
 ];
 
 function checkEnvVars() {
@@ -46,7 +42,7 @@ function checkEnvVars() {
 // DB Connection
 // =============================================================================
 
-const sql = postgres(process.env.DATABASE_URL, {
+const sql = postgres(process.env.SUPABASE_DATABASE_URL, {
   ssl: { rejectUnauthorized: false },
 });
 
@@ -227,24 +223,19 @@ let sfAccessToken = null;
 let sfInstanceUrl = null;
 
 async function authenticateSalesforce() {
-  const loginUrl = process.env.SALESFORCE_LOGIN_URL;
-  const clientId = process.env.SALESFORCE_CLIENT_ID;
-  const clientSecret = process.env.SALESFORCE_CLIENT_SECRET;
-  const username = process.env.SALESFORCE_USERNAME;
-  const password = process.env.SALESFORCE_PASSWORD;
-  const securityToken = process.env.SALESFORCE_SECURITY_TOKEN;
+  const tokenUrl = process.env.SALESFORCE_OAUTH_TOKEN_URL;
+  const clientId = process.env.SALESFORCE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.SALESFORCE_OAUTH_CLIENT_SECRET;
 
-  log('Authenticating with Salesforce...');
+  log('Authenticating with Salesforce via OAuth client credentials...');
 
   const params = new URLSearchParams({
-    grant_type: 'password',
+    grant_type: 'client_credentials',
     client_id: clientId,
     client_secret: clientSecret,
-    username,
-    password: `${password}${securityToken}`,
   });
 
-  const response = await fetch(`${loginUrl}/services/oauth2/token`, {
+  const response = await fetch(tokenUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
@@ -517,34 +508,6 @@ async function syncSalesforce() {
 }
 
 // =============================================================================
-// Phase: Upload Coverage Zips CSV
-// =============================================================================
-
-async function uploadCoverageZipsCsv() {
-  log('Uploading coverage zips CSV to app...');
-
-  const appUrl = process.env.BLC_APP_URL;
-
-  try {
-    const response = await fetch(`${appUrl}/api/internal/coverage-zips/upload-csv`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ syncRunId }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`CSV upload failed: ${response.status} ${text}`);
-    }
-
-    log('Coverage zips CSV uploaded successfully.');
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`CSV upload error (non-fatal): ${message}`);
-  }
-}
-
-// =============================================================================
 // Phase: Post-Processing
 // =============================================================================
 
@@ -598,30 +561,6 @@ async function postProcessing() {
   log('Refreshing materialized views...');
   await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY coverage_zips_summary`;
   log('Materialized views refreshed.');
-
-  // 4. Clear caches
-  log('Clearing app caches...');
-  const appUrl = process.env.BLC_APP_URL;
-  try {
-    const response = await fetch(`${appUrl}/api/internal/coverage-zips/clear-cache`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ syncRunId }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Cache clear failed: ${response.status} ${text}`);
-    }
-
-    log('App caches cleared successfully.');
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`Cache clear error (non-fatal): ${message}`);
-  }
-
-  // 5. Upload CSV
-  await uploadCoverageZipsCsv();
 
   log('Post-processing complete.');
 }
