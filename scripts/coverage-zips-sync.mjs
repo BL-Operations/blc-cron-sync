@@ -16,7 +16,7 @@ import postgres from 'postgres';
 // =============================================================================
 
 const MAX_RETRIES = 3;
-const BATCH_SIZE = 2000;
+const BATCH_SIZE = 500;
 const SALESFORCE_API_VERSION = 'v59.0';
 const TABLEAU_API_VERSION = '3.22';
 
@@ -47,6 +47,10 @@ const sql = postgres(process.env.SUPABASE_DATABASE_URL, {
   idle_timeout: 20,
   connect_timeout: 10,
 });
+
+// Disable Supabase's default statement timeout for this long-running batch job.
+// The GitHub Actions workflow has its own timeout-minutes: 360 as the safety net.
+await sql`SET statement_timeout = 0`;
 
 // =============================================================================
 // Shared State
@@ -443,12 +447,26 @@ async function processCategory(category, rows) {
 // --- Phase 2: Stale Data Cleanup ---
 
 async function cleanupStaleData() {
-  log('Cleaning up stale data...');
-  const result = await sql`
-    DELETE FROM single_coverage_zips_raw
-    WHERE sync_run_id != ${syncRunId} OR sync_run_id IS NULL
-  `;
-  log(`Deleted ${result.count} stale rows.`);
+  log('Cleaning up stale data in batches...');
+  const CLEANUP_BATCH = 50000;
+  let totalDeleted = 0;
+
+  while (true) {
+    const result = await sql`
+      DELETE FROM single_coverage_zips_raw
+      WHERE id IN (
+        SELECT id FROM single_coverage_zips_raw
+        WHERE sync_run_id != ${syncRunId} OR sync_run_id IS NULL
+        LIMIT ${CLEANUP_BATCH}
+      )
+    `;
+    const deleted = result.count;
+    totalDeleted += deleted;
+    if (deleted === 0) break;
+    log(`  Deleted batch: ${deleted} rows (total so far: ${totalDeleted})`);
+  }
+
+  log(`Deleted ${totalDeleted} stale rows total.`);
 }
 
 // --- Phase 3: Salesforce Sync ---
@@ -575,7 +593,7 @@ async function syncSalesforce() {
         log(`Found existing Campaign Group (tracking): ${sfCampaignGroupId}`);
       } else {
         // Query Salesforce
-        const soql = `SELECT Id FROM Campaign_Group__c WHERE Name = '${campaignGroupName.replace(/'/g, "\\'")}' AND Account__c = '${sfAccountId}' LIMIT 1`;
+        const soql = `SELECT Id FROM Product_Group__c WHERE Name = '${campaignGroupName.replace(/'/g, "\\'")}' AND Account__c = '${sfAccountId}' LIMIT 1`;
         const queryRes = await salesforceRequest(
           `/services/data/${SALESFORCE_API_VERSION}/query?q=${encodeURIComponent(soql)}`
         );
@@ -593,7 +611,7 @@ async function syncSalesforce() {
         } else {
           log(`Creating new Campaign Group: "${campaignGroupName}" for Account ${sfAccountId}`);
           const createRes = await salesforceRequest(
-            `/services/data/${SALESFORCE_API_VERSION}/sobjects/Campaign_Group__c`,
+            `/services/data/${SALESFORCE_API_VERSION}/sobjects/Product_Group__c`,
             {
               method: 'POST',
               body: {
@@ -632,7 +650,7 @@ async function syncSalesforce() {
 
       // PATCH active zip count
       const patchRes = await salesforceRequest(
-        `/services/data/${SALESFORCE_API_VERSION}/sobjects/Campaign_Group__c/${sfCampaignGroupId}`,
+        `/services/data/${SALESFORCE_API_VERSION}/sobjects/Product_Group__c/${sfCampaignGroupId}`,
         {
           method: 'PATCH',
           body: { Active_Zip_Code_Count__c: parseInt(active_zip_count, 10) },
