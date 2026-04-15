@@ -20,14 +20,17 @@ function getEnv(key) {
 const dbUrl = getEnv('DATABASE_URL');
 const sfClientId = getEnv('SALESFORCE_OAUTH_CLIENT_ID');
 const sfClientSecret = getEnv('SALESFORCE_OAUTH_CLIENT_SECRET');
-// Token URL might be missing if not set in secrets, provide default
 const sfTokenUrlRaw = process.env['SALESFORCE_OAUTH_TOKEN_URL'] || 'https://login.salesforce.com/services/oauth2/token';
 
 const sql = postgres(dbUrl, {
-  ssl: { rejectUnauthorized: false }, // Should be true in strict prod but often false for hosted DBs
+  ssl: { rejectUnauthorized: false },
   idle_timeout: 20,
   max: 5
 });
+
+// Disable Supabase's default statement timeout for this long-running batch job.
+// The GitHub Actions workflow concurrency settings act as the safety net.
+await sql`SET statement_timeout = 0`;
 
 // Helper to normalize SF URLs
 function normalizeSfUrl(url) {
@@ -53,7 +56,6 @@ async function getSalesforceTokens() {
     return { accessToken: cachedAccessToken, instanceUrl: cachedInstanceUrl };
   }
 
-  // Get tokens from DB
   const tokens = await sql`
     SELECT access_token, refresh_token, instance_url, expires_at 
     FROM salesforce_oauth_tokens 
@@ -67,9 +69,8 @@ async function getSalesforceTokens() {
   const tokenRecord = tokens[0];
   const now = new Date();
   const expiresAt = new Date(tokenRecord.expires_at);
-  const bufferMs = 5 * 60 * 1000; // 5 min buffer
+  const bufferMs = 5 * 60 * 1000;
 
-  // If token is valid, use it
   if (expiresAt.getTime() > now.getTime() + bufferMs) {
     console.log("Using existing Salesforce access token.");
     cachedAccessToken = tokenRecord.access_token;
@@ -77,7 +78,6 @@ async function getSalesforceTokens() {
     return { accessToken: cachedAccessToken, instanceUrl: cachedInstanceUrl };
   }
 
-  // Refresh token
   console.log("Salesforce token expired, refreshing...");
   return refreshSalesforceToken(tokenRecord.refresh_token, tokenRecord.instance_url);
 }
@@ -104,12 +104,9 @@ async function refreshSalesforceToken(refreshToken, currentInstanceUrl) {
   const accessToken = data.access_token;
   const instanceUrl = data.instance_url || currentInstanceUrl;
   
-  // Update DB
-  // Salesforce usually returns expires_in, but if not we assume 2 hours
   const expiresInSeconds = 2 * 60 * 60;
   const newExpiresAt = new Date(Date.now() + expiresInSeconds * 1000);
 
-  // We delete old and insert new to be safe with single row logic often used
   await sql`DELETE FROM salesforce_oauth_tokens`;
   await sql`
     INSERT INTO salesforce_oauth_tokens (access_token, refresh_token, instance_url, token_type, expires_at)
@@ -141,11 +138,10 @@ async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
 
   if (response.status === 401 && retryCount < 1) {
     console.log("Got 401 from Salesforce, forcing token refresh and retrying...");
-    cachedAccessToken = null; // Force refresh
+    cachedAccessToken = null;
     return salesforceRequest(endpoint, options, retryCount + 1);
   }
 
-  // PATCH returns 204 No Content on success
   if (response.status === 204) {
     return response;
   }
@@ -187,11 +183,8 @@ async function main() {
   };
 
   try {
-    // 1. Fetch Source Data (Tableau + Mappings)
     console.log("Fetching distinct combinations from database...");
     
-    // This query mirrors the logic in helpers/campaignGroupSyncHelper.tsx and campaignGroupSyncDeltaCheck.tsx
-    // It joins tableau data with unified accounts (to get SF Account ID) and category mappings (to get SF Category)
     const sourceRows = await sql`
       SELECT DISTINCT
         tcd.account AS tableau_account,
@@ -213,7 +206,6 @@ async function main() {
 
     console.log(`Found ${sourceRows.length} source combinations.`);
 
-    // 2. Fetch Tracking Data
     const trackingRows = await sql`
       SELECT salesforce_account_id, product, salesforce_category 
       FROM campaign_groups_sync_tracking
@@ -226,7 +218,6 @@ async function main() {
 
     console.log(`Found ${trackingRows.length} already tracked combinations.`);
 
-    // 3. Process Differences
     for (const row of sourceRows) {
       stats.processed++;
       const { 
@@ -237,7 +228,6 @@ async function main() {
         mapped_category: sfCategory 
       } = row;
 
-      // Logic: Determine Product
       let product = product_type;
       if (!product) {
         product = "Marketplace - Standard - HS";
@@ -258,29 +248,24 @@ async function main() {
 
       const key = `${sfAccountId}|${product}|${sfCategory}`;
       
-      // If already tracked, skip
       if (trackedSet.has(key)) {
         continue;
       }
 
       console.log(`Processing untracked group: Account=${sfAccountId}, Product=${product}, Category=${sfCategory}`);
 
-      // Construct Name
       const campaignGroupName = `${product} | ${sfCategory}`;
       let sfId = null;
 
       try {
-        // 4. Check Salesforce
         const soql = `SELECT Id FROM Campaign_Group__c WHERE Account__c = '${sfAccountId}' AND Name = '${campaignGroupName}' LIMIT 1`;
         const sfResult = await salesforceQuery(soql);
 
         if (sfResult.records && sfResult.records.length > 0) {
-          // Exists in SF
           sfId = sfResult.records[0].Id;
           stats.existing++;
           console.log(`-> Found existing in SF: ${sfId}`);
         } else {
-          // 5. Create in Salesforce
           console.log(`-> Creating new Campaign Group: ${campaignGroupName}`);
           
           const createResult = await salesforceCreate("Campaign_Group__c", {
@@ -301,7 +286,6 @@ async function main() {
           }
         }
 
-        // 6. Update Tracking Table
         if (sfId) {
           await sql`
             INSERT INTO campaign_groups_sync_tracking (salesforce_account_id, product, salesforce_category, salesforce_campaign_group_id, updated_at)
@@ -309,7 +293,6 @@ async function main() {
             ON CONFLICT (salesforce_account_id, product, salesforce_category) 
             DO UPDATE SET updated_at = NOW(), salesforce_campaign_group_id = ${sfId}
           `;
-                // Add to local set so we don't process duplicates if source data has multiples mapping to same result
           trackedSet.add(key); 
         }
 
@@ -325,9 +308,6 @@ async function main() {
 
     if (stats.errors > 0) {
        console.warn("Finished with errors.");
-       // We usually don't want to crash the whole job if some items failed, unless it was catastrophic.
-       // But if you want to flag the job as failed in GitHub, you can exit 1 here.
-       // For now, we exit 0 because partial success is better than retrying the whole thing.
     }
 
   } catch (error) {
