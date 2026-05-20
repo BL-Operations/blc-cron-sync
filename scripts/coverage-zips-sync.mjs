@@ -10,6 +10,15 @@
  */
 
 import postgres from 'postgres';
+import { setGlobalDispatcher, Agent } from 'undici';
+
+// Increase the default fetch timeout for large Tableau view downloads.
+// Node's built-in fetch (undici) has a 300s headers timeout by default,
+// which is too short for large Tableau views that take minutes to prepare.
+setGlobalDispatcher(new Agent({
+  headersTimeout: 20 * 60 * 1000,  // 20 minutes
+  bodyTimeout:    20 * 60 * 1000,  // 20 minutes
+}));
 
 // =============================================================================
 // 1. Configuration & Env Vars
@@ -493,7 +502,7 @@ async function uploadCoverageZipsCsv(sfGroupId, category, product, zipsData) {
   );
   const csvContent = [csvHeader, ...csvRows].join('\n');
 
-  const boundary = `----FlootBoundary${Math.random().toString(36).substr(2, 16)}`;
+  const boundary = `----FlootBoundary${Math.random().toString(36).substring(2, 18)}`;
 
   const metadata = {
     Title: `Coverage Zips - ${category}`,
@@ -754,7 +763,7 @@ async function main() {
 
   try {
     // Generate run ID without crypto.randomUUID()
-    syncRunId = `sync_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    syncRunId = `sync_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
 
     const syncRes = await sql`
       INSERT INTO single_coverage_zips_sync_state
