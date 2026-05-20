@@ -176,7 +176,7 @@ async function authenticateTableau() {
   log('Tableau authentication successful.');
 }
 
-async function downloadViewData(filter) {
+async function downloadViewDataResponse(filter) {
   const viewId = process.env.TABLEAU_VIEW_COVERAGE_ZIPS_ID;
   let url = `${process.env.TABLEAU_SERVER_URL}/api/${TABLEAU_API_VERSION}/sites/${tableauSiteId}/views/${viewId}/data`;
   if (filter) {
@@ -192,7 +192,7 @@ async function downloadViewData(filter) {
     throw new Error(`Failed to download Tableau data (filter=${filter}): ${response.statusText}`);
   }
 
-  return response.text();
+  return response;
 }
 
 // =============================================================================
@@ -219,27 +219,138 @@ function parseCSVLine(line) {
   return result.map((s) => s.trim().replace(/^"|"$/g, '').replace(/""/g, '"'));
 }
 
-function parseCSV(text) {
-  const lines = text.split(/\r?\n/);
-  if (lines.length < 2) return [];
+async function streamAndUpsertToDb(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  const categories = new Set();
+  
+  let buffer = '';
+  let headers = null;
+  let rowCount = 0;
+  let batch = [];
 
-  const headers = parseCSVLine(lines[0]);
-  const results = [];
+  async function flushBatch() {
+    if (batch.length === 0) return;
 
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
+    const dedupedMap = new Map();
+    for (const row of batch) {
+      const key = `${row.lead_buyer}\0${row.lead_buy_campaign}\0${row.category}\0${row.zip}`;
+      dedupedMap.set(key, row);
+    }
+    const validRows = [...dedupedMap.values()];
 
-    const values = parseCSVLine(line);
-    if (values.length !== headers.length) continue;
+    try {
+      await sql`
+        INSERT INTO single_coverage_zips_raw ${sql(validRows)}
+        ON CONFLICT (lead_buyer, lead_buy_campaign, category, zip)
+        DO UPDATE SET
+          sync_run_id    = EXCLUDED.sync_run_id,
+          updated_at     = NOW(),
+          is_branded     = EXCLUDED.is_branded,
+          city           = EXCLUDED.city,
+          state          = EXCLUDED.state,
+          county         = EXCLUDED.county,
+          dma            = EXCLUDED.dma,
+          buyer_status   = EXCLUDED.buyer_status,
+          campaign_status = EXCLUDED.campaign_status
+      `;
+      await updateSyncState({ recordsProcessed: validRows.length });
+    } catch (err) {
+      log(`Error inserting batch: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    batch = [];
+  }
+
+  async function processLine(line) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    const values = parseCSVLine(trimmed);
+    if (!headers) {
+      headers = values;
+      return;
+    }
+
+    if (values.length !== headers.length) return;
 
     const row = {};
     headers.forEach((h, idx) => {
       row[h] = values[idx];
     });
-    results.push(row);
+
+    const leadBuyer = row['Lead Buyer'];
+    const zip = row['Zip'];
+
+    if (!leadBuyer || !zip) return;
+
+    const leadBuyCampaign = row['Lead Buy Campaign'] ?? null;
+    const cat = row['Category'];
+
+    if (!cat) return;
+
+    categories.add(cat);
+
+    const lbLower = (leadBuyCampaign || '').toLowerCase();
+    const isBranded = lbLower.includes('microsite') || lbLower.includes('branded');
+
+    batch.push({
+      lead_buyer: leadBuyer,
+      lead_buy_campaign: leadBuyCampaign,
+      category: cat,
+      zip,
+      city: row['City'] ?? null,
+      state: row['State'] ?? null,
+      county: row['County'] ?? null,
+      dma: row['DMA'] ?? null,
+      country: row['Country'] ?? 'US',
+      is_branded: isBranded,
+      buyer_status: row['Buyer Status'] ?? null,
+      campaign_status: row['Campaign Status'] ?? null,
+      sync_run_id: syncRunId,
+      updated_at: new Date(),
+    });
+
+    rowCount++;
+
+    if (batch.length >= BATCH_SIZE) {
+      await flushBatch();
+    }
+
+    if (rowCount % 50000 === 0) {
+      const memoryUsage = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
+      log(`Streamed ${rowCount} rows... (Memory: ${memoryUsage} MB) Categories seen: ${categories.size}`);
+    }
   }
-  return results;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    
+    if (value) {
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop(); // Keep the last incomplete line in the buffer
+      
+      for (const line of lines) {
+        await processLine(line);
+      }
+    }
+
+    if (done) {
+      buffer += decoder.decode();
+      if (buffer) {
+        await processLine(buffer);
+      }
+      break;
+    }
+  }
+
+  if (batch.length > 0) {
+    await flushBatch();
+  }
+
+  log(`Streaming complete. Total rows processed: ${rowCount}`);
+  return { totalRows: rowCount, categories };
 }
 
 // =============================================================================
@@ -378,80 +489,6 @@ async function salesforceRequest(endpoint, options = {}, retryCount = 0) {
 // =============================================================================
 // 7. Phase Functions
 // =============================================================================
-
-// --- Phase 1: Tableau Extraction ---
-
-async function processCategory(category, rows) {
-  try {
-    log(`Processing ${rows.length} rows for category: ${category}`);
-
-    // Use a Map to deduplicate by conflict key (lead_buyer, lead_buy_campaign, category, zip)
-    // Tableau data can contain duplicate rows; last occurrence wins.
-    const deduped = new Map();
-
-    for (const row of rows) {
-      const leadBuyer = row['Lead Buyer'];
-      const zip = row['Zip'];
-
-      if (!leadBuyer || !zip) continue;
-
-      const leadBuyCampaign = row['Lead Buy Campaign'] ?? null;
-      // Note: we use the passed 'category' which comes from the grouping key, 
-      // ensuring consistency if the row['Category'] was slightly different or we want to enforce it.
-      // However, the grouping logic guarantees row['Category'] === category.
-      const cat = category;
-      const key = `${leadBuyer}\0${leadBuyCampaign}\0${cat}\0${zip}`;
-
-      // Derive is_branded from lead_buy_campaign
-      const lbLower = (leadBuyCampaign || '').toLowerCase();
-      const isBranded = lbLower.includes('microsite') || lbLower.includes('branded');
-
-      deduped.set(key, {
-        lead_buyer: leadBuyer,
-        lead_buy_campaign: leadBuyCampaign,
-        category: cat,
-        zip,
-        city: row['City'] ?? null,
-        state: row['State'] ?? null,
-        county: row['County'] ?? null,
-        dma: row['DMA'] ?? null,
-        country: row['Country'] ?? 'US',
-        is_branded: isBranded,
-        buyer_status: row['Buyer Status'] ?? null,
-        campaign_status: row['Campaign Status'] ?? null,
-        sync_run_id: syncRunId,
-        updated_at: new Date(),
-      });
-    }
-
-    const validRows = [...deduped.values()];
-    log(`Deduplicated to ${validRows.length} unique rows (from ${rows.length} input).`);
-
-    for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
-      const batch = validRows.slice(i, i + BATCH_SIZE);
-      await sql`
-        INSERT INTO single_coverage_zips_raw ${sql(batch)}
-        ON CONFLICT (lead_buyer, lead_buy_campaign, category, zip)
-        DO UPDATE SET
-          sync_run_id    = EXCLUDED.sync_run_id,
-          updated_at     = NOW(),
-          is_branded     = EXCLUDED.is_branded,
-          city           = EXCLUDED.city,
-          state          = EXCLUDED.state,
-          county         = EXCLUDED.county,
-          dma            = EXCLUDED.dma,
-          buyer_status   = EXCLUDED.buyer_status,
-          campaign_status = EXCLUDED.campaign_status
-      `;
-    }
-
-    log(`Upserted ${validRows.length} rows for category: ${category}`);
-    await updateSyncState({ recordsProcessed: validRows.length });
-  } catch (err) {
-    log(`Error processing category "${category}": ${err instanceof Error ? err.message : String(err)}`);
-    // Non-fatal — continue with remaining categories
-  }
-}
 
 // --- Phase 2: Stale Data Cleanup ---
 
@@ -792,32 +829,14 @@ async function main() {
     // 1. Download full view data
     await updateSyncState({ state: 'Downloading full Tableau view data...' });
     log('Downloading full view data from Tableau...');
-    const csvText = await downloadViewData('');
-    const allRows = parseCSV(csvText);
-    log(`Downloaded and parsed ${allRows.length} total rows.`);
+    const csvResponse = await downloadViewDataResponse('');
+    
+    // 2. Stream and upsert to database
+    await updateSyncState({ state: 'Streaming and upserting data' });
+    const { totalRows, categories } = await streamAndUpsertToDb(csvResponse);
 
-    // 2. Group by Category
-    const rowsByCategory = new Map();
-    for (const row of allRows) {
-      const cat = row['Category'];
-      if (!cat) continue;
-
-      if (!rowsByCategory.has(cat)) {
-        rowsByCategory.set(cat, []);
-      }
-      rowsByCategory.get(cat).push(row);
-    }
-
-    const categories = [...rowsByCategory.keys()];
-    log(`Found ${categories.length} categories: ${categories.join(', ')}`);
-
-    // 3. Process each category
-    await updateSyncState({ state: `Extracting ${categories.length} categories` });
-    for (const cat of categories) {
-      log(`Processing category: ${cat}`);
-      const categoryRows = rowsByCategory.get(cat) || [];
-      await processCategory(cat, categoryRows);
-    }
+    log(`Extracted and upserted ${totalRows} rows across ${categories.size} categories.`);
+    log(`Categories: ${[...categories].join(', ')}`);
 
     // --- Phase 2: Cleanup ---
     await updateSyncState({ phase: 2, state: 'Cleaning up stale data' });
