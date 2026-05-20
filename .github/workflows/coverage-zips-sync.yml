@@ -22,8 +22,8 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install Dependencies
-        run: npm install postgres
+            - name: Install Dependencies
+        run: npm install postgres undici
 
       - name: Run Sync Script
         env:
